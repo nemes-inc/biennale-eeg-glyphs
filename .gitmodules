@@ -1,0 +1,3 @@
+[submodule "app/ACT-lib"]
+	path = app/ACT-lib
+	url = git@github.com:nemes-inc/ACT-lib.git

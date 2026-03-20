@@ -7,6 +7,10 @@
     {
       "path": "services/print-glyph"
     },
+    {
+      "name": "muse-rs",
+      "path": "app"
+    },
   ],
   "settings": {
     "java.configuration.updateBuildConfiguration": "disabled",

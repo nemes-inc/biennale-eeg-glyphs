@@ -193,6 +193,7 @@ __pycache__/
 
 # Exception to .lock
 !uv.lock
+!**/Cargo.lock
 
 # Firebase
 *.cache
