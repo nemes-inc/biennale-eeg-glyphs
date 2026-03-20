@@ -14,14 +14,6 @@ firmware — and automatically selects the correct protocol at connection time.
 
 ![PPG view](./docs/ppg.png)
 
-## Installation
-
-```shell
-cargo add muse-rs
-```
-
----
-
 ## Supported hardware
 
 | Model | Firmware | EEG ch | PPG | AUX | Detection |
@@ -220,6 +212,7 @@ Athena always includes PPG with preset `p1045`.
 | Linux | `bluez` + `dbus` (`libdbus-1-dev`) |
 | macOS | Core Bluetooth — see notes below |
 | Windows | WinRT Bluetooth — works out of the box |
+| **ACT feature only** | [MLX](https://github.com/ml-explore/mlx) installed to `/usr/local` (headers + static lib) |
 
 ### Linux — install system dependencies
 
@@ -266,12 +259,38 @@ unreachable.
 
 ---
 
+## Setup
+
+This project lives under `app/` in the `biennale-eeg-glyphs` mono-repo.
+**ACT-lib** is a git submodule — initialise it after cloning:
+
+```bash
+git submodule update --init --recursive
+```
+
+### Install MLX (required for `act` feature only)
+
+ACT-lib links against [Apple MLX](https://github.com/ml-explore/mlx) for GPU-accelerated
+chirplet transforms.  Install it so that headers land in `/usr/local/include` and
+`libmlx.a` in `/usr/local/lib`:
+
+```bash
+git clone https://github.com/ml-explore/mlx.git /tmp/mlx
+cmake -S /tmp/mlx -B /tmp/mlx/build -DCMAKE_INSTALL_PREFIX=/usr/local -DMLX_BUILD_TESTS=OFF
+cmake --build /tmp/mlx/build -j
+sudo cmake --install /tmp/mlx/build
+```
+
+---
+
 ## Build
 
 ```bash
-cd muse-rs
-cargo build --release          # builds lib + both binaries (tui feature on by default)
-cargo build --no-default-features  # builds lib + headless CLI only (no ratatui/crossterm)
+# From the app/ directory:
+
+cargo build --release                  # lib + all binaries (TUI on by default, no ACT)
+cargo build --release --features act   # lib + all binaries + ACT chirplet engine (requires MLX)
+cargo build --no-default-features      # lib + headless CLI only (no ratatui/crossterm)
 ```
 
 ---
@@ -279,8 +298,10 @@ cargo build --no-default-features  # builds lib + headless CLI only (no ratatui/
 ## TUI — real-time waveform viewer
 
 ```bash
-cargo run --bin tui                # scan → auto-connect to first found device
-cargo run --bin tui -- --simulate  # built-in EEG simulator (no hardware needed)
+cargo run --bin tui                           # scan → auto-connect to first found device
+cargo run --bin tui -- --simulate             # built-in EEG simulator (no hardware needed)
+cargo run --bin tui --features act             # with ACT chirplet engine enabled
+cargo run --bin tui --features act -- --simulate  # simulator + ACT
 ```
 
 ### EEG view (default)
@@ -353,25 +374,54 @@ advertising).
 
 ### TUI key reference
 
+#### Views
+
+| Key | View | Notes |
+|---|---|---|
+| `1` | EEG | 4-channel waveforms (default) |
+| `2` | PPG | 3 optical channels (ambient, IR, red) |
+| `3` | Info | Contact quality / signal diagnostics |
+| `4` | IMU | Accelerometer + gyroscope |
+| `5` | ACT | Chirplet decomposition *(act feature)* |
+| `6` | Baseline | Eyes-closed baseline capture *(act feature)* |
+| `7` | Absorption | Absorption measurement *(act feature)* |
+| `8` | Entrainment | Auditory entrainment detection *(act feature)* |
+| `9` | Bands | EEG frequency band history *(act feature)* |
+| `0` | Approach (FAA) | Frontal alpha asymmetry *(act feature)* |
+
+#### General
+
 | Key | Context | Action |
 |---|---|---|
 | `Tab` | streaming | open device picker |
-| `1` | streaming | switch to EEG view (4 channels) |
-| `2` | streaming | switch to PPG view (3 optical channels) |
 | `s` | streaming / picker | rescan for Muse devices |
 | `d` | streaming | disconnect and rescan |
 | `+` / `=` | EEG view | zoom out (increase µV scale) |
 | `-` | EEG view | zoom in (decrease µV scale) |
 | `a` | EEG view | auto-scale to current peak |
 | `v` | streaming | toggle smooth overlay |
+| `w` | streaming | toggle CSV recording (raw EEG + FFT bands) |
 | `p` | streaming | pause streaming |
 | `r` | streaming | resume streaming |
 | `c` | streaming | clear all waveform buffers |
 | `q` / Esc | streaming | quit |
 | `↑` / `↓` | picker | navigate list |
 | Enter | picker | connect to selected device |
-| `s` | picker | rescan |
 | Esc | picker | close picker |
+
+#### ACT-feature measurements *(require `--features act`)*
+
+| Key | Action |
+|---|---|
+| `b` | start / stop baseline capture |
+| `m` | start / stop absorption measurement |
+| `n` | start / stop entrainment detection |
+| `g` | start / stop approach (FAA) measurement |
+| `t` / `T` | decrease / increase absorption threshold |
+| `f` / `F` | decrease / increase entrainment beat frequency |
+| `j` / `J` | decrease / increase entrainment SNR threshold |
+| `h` / `H` | decrease / increase approach deadband |
+| `[` / `]` | zoom in / out bands view x-axis |
 
 ### Simulator
 
@@ -427,6 +477,32 @@ cat muse-tui.log
 
 ---
 
+## OSC reader (`osc-reader` binary)
+
+Receives Mind Monitor's OSC stream over UDP and logs every message to a
+timestamped CSV for offline comparison with muse-rs captures:
+
+```bash
+cargo run --bin osc-reader -- --port 5000 --output mind-monitor.csv
+```
+
+In Mind Monitor: **Settings → OSC Stream Target IP** = this machine's IP,
+**Port** = 5000, then tap **Start Streaming**.
+
+---
+
+## Tests
+
+```bash
+cargo test                                   # core library tests
+cargo test --features act -- --test-threads=1  # ACT tests (single-threaded — Metal concurrency)
+```
+
+> **Note:** ACT tests must run with `--test-threads=1` to avoid Metal command
+> buffer concurrency crashes.
+
+---
+
 ## Configuration
 
 ```rust
@@ -452,24 +528,37 @@ let config = MuseClientConfig {
 ## Project layout
 
 ```
-muse-rs/
+app/
 ├── Cargo.toml
-├── build.rs             # macOS Info.plist embedding for CoreBluetooth
-├── Info.plist           # NSBluetoothAlwaysUsageDescription
+├── build.rs               # macOS Info.plist embedding + ACT C++ compilation
+├── Info.plist              # NSBluetoothAlwaysUsageDescription
+├── ACT-lib/               # ⇐ git submodule (nemes-inc/ACT-lib)
+│   └── actlib/            # C++ ACT engine, ALGLIB, Eigen
+├── ffi/
+│   ├── act_bridge.cpp     # extern "C" shim around ACT_MLX_f
+│   ├── act_bridge.h       # C bridge header
+│   └── test_bridge.cpp    # Standalone C++ test harness
+├── tests/
+│   └── act_integration.rs # Integration tests for ACT FFI
 └── src/
-    ├── lib.rs           # Crate root: module declarations + prelude
-    ├── main.rs          # Headless CLI binary (cargo run)
+    ├── lib.rs             # Crate root: module declarations + prelude
+    ├── main.rs            # Headless CLI binary (cargo run)
     ├── bin/
-    │   └── tui.rs       # Full-screen TUI binary (cargo run --bin tui)
-    │                    # EEG + PPG views, device picker, smooth overlay
-    ├── muse_client.rs   # MuseClient (scan/connect) + MuseHandle (commands)
-    │                    # Firmware detection + dual protocol dispatch
-    │                    # BLE disconnect detection (adapter event stream)
-    ├── protocol.rs      # GATT UUIDs, sampling constants, encode/decode helpers
-    ├── parse.rs         # Classic decoders (12-bit EEG, 24-bit PPG, BE IMU)
-    │                    # Athena decoder (tag-based: EEG, PPG, IMU, battery)
-    │                    # ControlAccumulator (JSON fragment reassembly)
-    └── types.rs         # EegReading, PpgReading, ImuData, MuseEvent, …
+    │   ├── tui.rs         # Full-screen TUI binary (all views + device picker)
+    │   └── osc_reader.rs  # Mind Monitor OSC → CSV logger
+    ├── muse_client.rs     # MuseClient (scan/connect) + MuseHandle (commands)
+    ├── protocol.rs        # GATT UUIDs, sampling constants, encode/decode helpers
+    ├── parse.rs           # Classic + Athena packet decoders
+    ├── types.rs           # EegReading, PpgReading, ImuData, MuseEvent, …
+    ├── compute.rs         # Contact quality, forehead detection
+    ├── filters.rs         # EEG channel filters, epoch validation
+    ├── act_ffi.rs         # Raw extern "C" FFI bindings (act feature)
+    ├── act.rs             # Safe ActEngine wrapper (act feature)
+    ├── alpha.rs           # EEG frequency band extraction (act feature)
+    ├── baseline.rs        # Eyes-closed baseline detector (act feature)
+    ├── absorption.rs      # Absorption measurement (act feature)
+    ├── entrainment.rs     # Auditory entrainment detection (act feature)
+    └── approach.rs        # Frontal alpha asymmetry / approach (act feature)
 ```
 
 ---
@@ -563,6 +652,10 @@ stream, handling nested objects and fragments that split mid-token.
 | [tokio](https://tokio.rs) | Async runtime |
 | [ratatui](https://ratatui.rs) | Terminal UI framework (optional, `tui` feature) |
 | [crossterm](https://github.com/crossterm-rs/crossterm) | Terminal backend (optional, `tui` feature) |
+| [rustfft](https://crates.io/crates/rustfft) | FFT for band-power extraction (optional, `act` feature) |
+| [cc](https://crates.io/crates/cc) | Build-time C++ compilation for ACT-lib |
+| [clap](https://crates.io/crates/clap) | CLI argument parsing |
+| [rosc](https://crates.io/crates/rosc) | OSC protocol for Mind Monitor integration |
 
 ---
 
