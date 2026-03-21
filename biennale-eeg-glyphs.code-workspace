@@ -5,7 +5,12 @@
       "path": "./"
     },
     {
+      "name": "print-glyph",
       "path": "services/print-glyph"
+    },
+    {
+      "name": "zuna",
+      "path": "services/zuna"
     },
     {
       "name": "muse-rs",

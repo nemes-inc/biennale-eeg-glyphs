@@ -1,0 +1,6 @@
+/target/
+Cargo.lock
+py/.venv/
+py/build/
+py/dist/
+py/*.spec
