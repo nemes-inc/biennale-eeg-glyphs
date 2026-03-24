@@ -41,6 +41,11 @@ path = "src/bin/osc_reader.rs"
 name = "muse-record-fif"
 path = "src/bin/muse_record_fif.rs"
 
+# Stream Muse EEG over TCP as EEGF binary frames (for remote eeg-viewer).
+[[bin]]
+name = "muse-stream-tcp"
+path = "src/bin/muse_stream_tcp.rs"
+
 # ── Features ──────────────────────────────────────────────────────────────────
 #
 # tui (default) — pulls in ratatui + crossterm for the terminal UI binary.
@@ -70,6 +75,7 @@ serde_json = "1"
 anyhow = "1"
 rosc = "0.10"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 
 # ── Optional TUI dependencies (feature = "tui") ───────────────────────────────
 
