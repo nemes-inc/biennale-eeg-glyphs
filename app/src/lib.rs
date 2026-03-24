@@ -86,6 +86,8 @@ pub mod absorption;
 pub mod entrainment;
 #[cfg(feature = "act")]
 pub mod approach;
+#[cfg(feature = "act")]
+pub mod alpha_trend;
 
 // ── Prelude ───────────────────────────────────────────────────────────────────
 

@@ -50,7 +50,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState,
-        Paragraph,
+        Paragraph, Sparkline,
     },
     Frame, Terminal,
 };
@@ -182,6 +182,8 @@ pub enum ViewMode {
     Bands,
     #[cfg(feature = "act")]
     Approach,
+    #[cfg(feature = "act")]
+    AlphaTrend,
 }
 
 // ── CSV recording ─────────────────────────────────────────────────────────────
@@ -400,6 +402,10 @@ pub struct App {
     #[cfg(feature = "act")]
     pub approach: muse_rs::approach::ApproachDetector,
 
+    // ── Alpha trend detector — feature-gated ─────────────────────────────
+    #[cfg(feature = "act")]
+    pub alpha_trend: muse_rs::alpha_trend::AlphaTrendDetector,
+
     // ── Band power time-series — feature-gated ─────────────────────────────
     #[cfg(feature = "act")]
     pub band_history: muse_rs::alpha::BandHistory,
@@ -469,6 +475,8 @@ impl App {
             entrainment: muse_rs::entrainment::EntrainmentDetector::default(),
             #[cfg(feature = "act")]
             approach: muse_rs::approach::ApproachDetector::default(),
+            #[cfg(feature = "act")]
+            alpha_trend: muse_rs::alpha_trend::AlphaTrendDetector::default(),
             #[cfg(feature = "act")]
             band_history: muse_rs::alpha::BandHistory::new(),
             #[cfg(feature = "act")]
@@ -590,6 +598,7 @@ impl App {
             self.absorption.stop();
             self.entrainment.stop();
             self.approach.stop();
+            self.alpha_trend.stop();
             self.band_history.clear();
         }
     }
@@ -750,6 +759,11 @@ impl App {
             if !self.approach.is_running() {
                 beep_twice();
             }
+        }
+
+        // Feed alpha trend detector with FFT results + artifact status
+        if self.alpha_trend.is_running() {
+            self.alpha_trend.feed(&fft_snap, &epoch_ok, &self.contact_quality);
         }
 
         self.fft_snapshot = Some(fft_snap);
@@ -1335,6 +1349,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ViewMode::Bands => "—".to_string(),
         #[cfg(feature = "act")]
         ViewMode::Approach => "—".to_string(),
+        #[cfg(feature = "act")]
+        ViewMode::AlphaTrend => "—".to_string(),
     };
     let view_label = match app.view {
         ViewMode::Eeg => "EEG",
@@ -1353,6 +1369,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ViewMode::Bands => "BANDS",
         #[cfg(feature = "act")]
         ViewMode::Approach => "FAA",
+        #[cfg(feature = "act")]
+        ViewMode::AlphaTrend => "α-TREND",
     };
     let total = format!("{}K smp", app.total_samples / 1_000);
 
@@ -1427,6 +1445,8 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
         ViewMode::Bands => draw_bands_view(frame, area, app),
         #[cfg(feature = "act")]
         ViewMode::Approach => draw_approach_view(frame, area, app),
+        #[cfg(feature = "act")]
+        ViewMode::AlphaTrend => draw_alpha_trend_view(frame, area, app),
     }
 }
 
@@ -2281,8 +2301,27 @@ fn draw_baseline_status(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
 
+    let settling = bl.config.settling_duration_s;
+    let recording = bl.config.recording_duration_s();
+    let total = bl.config.total_duration_s;
+    lines.push(Line::from(vec![
+        Span::styled(" Settling: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{settling:.0}s"),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Recording: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{recording:.0}s"),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  (total {total:.0}s)"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
     lines.push(Line::from(Span::styled(
-        " [b] Start/Stop baseline    [6] Switch to this view",
+        " [,/.] settling ±5s    [l/L] recording ±5s    [b] start/stop    [6] view",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -2585,8 +2624,11 @@ fn draw_baseline_summary(frame: &mut Frame, area: Rect, app: &App) {
         }
     } else {
         // Idle
+        let settling = bl.config.settling_duration_s;
+        let recording = bl.config.recording_duration_s();
+        let total = bl.config.total_duration_s;
         lines.push(Line::from(Span::styled(
-            " Press [b] to begin baseline collection (60s: 15s settling + 45s recording)",
+            format!(" Press [b] to begin baseline collection ({total:.0}s: {settling:.0}s settling + {recording:.0}s recording)"),
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
@@ -3047,11 +3089,14 @@ fn draw_absorption_gauge(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Render absorption controls: threshold, start/stop, key hints.
+/// Render absorption controls: threshold, timing, start/stop, key hints.
 #[cfg(feature = "act")]
 fn draw_absorption_controls(frame: &mut Frame, area: Rect, app: &App) {
     let ab = &app.absorption;
     let threshold = ab.config.threshold_pct;
+    let settling = ab.config.settling_duration_s;
+    let recording = ab.config.recording_duration_s();
+    let total = ab.config.measurement_duration_s;
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -3063,18 +3108,26 @@ fn draw_absorption_controls(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  Settling: ", Style::default().fg(Color::White)),
         Span::styled(
-            "    [t] −5%    [T] +5%",
+            format!("{settling:.0}s"),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Recording: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{recording:.0}s"),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  (total {total:.0}s)"),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
 
-    lines.push(Line::from(vec![
-        Span::styled(
-            " [m] Start/Stop measurement    [8] Switch to this view",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
+    lines.push(Line::from(Span::styled(
+        " [t/T] threshold    [,/.] settling ±5s    [l/L] recording ±5s    [m] start/stop",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -3492,11 +3545,14 @@ fn draw_approach_gauge(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Render approach controls: deadband, start/stop, key hints.
+/// Render approach controls: deadband, timing, start/stop, key hints.
 #[cfg(feature = "act")]
 fn draw_approach_controls(frame: &mut Frame, area: Rect, app: &App) {
     let ap = &app.approach;
     let deadband = ap.config.deadband;
+    let settling = ap.config.settling_duration_s;
+    let recording = ap.config.recording_duration_s();
+    let total = ap.config.measurement_duration_s;
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -3508,16 +3564,367 @@ fn draw_approach_controls(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  Settling: ", Style::default().fg(Color::White)),
         Span::styled(
-            "    [h] −0.02    [H] +0.02",
+            format!("{settling:.0}s"),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Recording: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{recording:.0}s"),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  (total {total:.0}s)"),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
 
-    lines.push(Line::from(vec![Span::styled(
-        " [g] Start/Stop measurement    [0] Switch to this view",
+    lines.push(Line::from(Span::styled(
+        " [h/H] deadband    [,/.] settling ±1s    [l/L] recording ±5s    [g] start/stop",
         Style::default().fg(Color::DarkGray),
-    )]));
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        area,
+    );
+}
+
+// ── Alpha Trend view ─────────────────────────────────────────────────────────
+
+/// Render the alpha trend measurement view.
+///
+/// Layout:
+/// - Top: status bar (phase, elapsed time, sample count)
+/// - Middle-top: sparkline chart of frontal alpha over time
+/// - Middle-bottom: trend metrics (slope, R², classification)
+/// - Bottom: controls + key hints
+#[cfg(feature = "act")]
+fn draw_alpha_trend_view(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::vertical([
+        Constraint::Length(4),   // status + progress
+        Constraint::Min(8),     // sparkline chart
+        Constraint::Length(10),  // trend metrics
+        Constraint::Length(4),   // controls
+    ])
+    .split(area);
+
+    draw_alpha_trend_status(frame, rows[0], app);
+    draw_alpha_trend_chart(frame, rows[1], app);
+    draw_alpha_trend_metrics(frame, rows[2], app);
+    draw_alpha_trend_controls(frame, rows[3], app);
+}
+
+/// Render status bar: phase, elapsed time, sample count.
+#[cfg(feature = "act")]
+fn draw_alpha_trend_status(frame: &mut Frame, area: Rect, app: &App) {
+    use muse_rs::alpha_trend::AlphaTrendPhase;
+
+    let at = &app.alpha_trend;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let (phase_label, phase_color) = match &at.phase {
+        AlphaTrendPhase::Idle => ("IDLE", Color::DarkGray),
+        AlphaTrendPhase::Settling => ("SETTLING", Color::Yellow),
+        AlphaTrendPhase::Measuring => ("MEASURING", Color::Green),
+        AlphaTrendPhase::Complete => ("COMPLETE", Color::Cyan),
+    };
+
+    let elapsed = at.elapsed_s();
+    let measuring = at.measuring_elapsed_s();
+    let n = at.result.as_ref().map(|r| r.n_samples).unwrap_or(0);
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {phase_label}"),
+            Style::default().fg(phase_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  elapsed: {elapsed:.0}s  recording: {measuring:.0}s  samples: {n}"),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    // Artifact ratio
+    let art = at.artifact_ratio();
+    let art_color = if art <= 0.30 { Color::Green } else { Color::Red };
+    lines.push(Line::from(vec![
+        Span::styled(" Artifact ratio: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{:.0}%", art * 100.0),
+            Style::default().fg(art_color),
+        ),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    " Alpha Trend ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
+
+/// Render sparkline chart of frontal alpha power over time with regression line.
+#[cfg(feature = "act")]
+fn draw_alpha_trend_chart(frame: &mut Frame, area: Rect, app: &App) {
+    let at = &app.alpha_trend;
+
+    if at.history.is_empty() {
+        let msg = if at.is_running() {
+            " Accumulating data…"
+        } else if at.phase == muse_rs::alpha_trend::AlphaTrendPhase::Idle {
+            " Press [i] to start alpha trend measurement"
+        } else {
+            " No data"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray)))
+                .block(
+                    Block::default()
+                        .title(" Frontal α Power ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                ),
+            area,
+        );
+        return;
+    }
+
+    // Build sparkline data: map alpha values to bar heights
+    let inner_w = (area.width as usize).saturating_sub(2); // account for borders
+    let history = &at.history;
+    let n = history.len();
+
+    // Downsample or take tail if history is wider than chart
+    let values: Vec<f64> = if n <= inner_w {
+        history.iter().map(|(_, y)| *y).collect()
+    } else {
+        // Take the most recent inner_w points
+        history[n - inner_w..].iter().map(|(_, y)| *y).collect()
+    };
+
+    // Find min/max for scaling
+    let y_min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let y_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y_range = (y_max - y_min).max(1e-6);
+
+    // Scale to 0..64 for sparkline
+    let spark_data: Vec<u64> = values
+        .iter()
+        .map(|&v| ((v - y_min) / y_range * 63.0).round() as u64)
+        .collect();
+
+    // Trend info for title
+    let title = if let Some(r) = &at.result {
+        let arrow = match r.label {
+            muse_rs::alpha_trend::TrendLabel::Rising => "↑",
+            muse_rs::alpha_trend::TrendLabel::Falling => "↓",
+            muse_rs::alpha_trend::TrendLabel::Flat => "→",
+        };
+        format!(
+            " Frontal α Power  {arrow} {:.1}%/min  R²={:.2} ",
+            r.trend_pct_per_min, r.r_squared
+        )
+    } else {
+        " Frontal α Power ".to_string()
+    };
+
+    let border_color = if at.is_running() { Color::Green } else { Color::Cyan };
+
+    frame.render_widget(
+        Sparkline::default()
+            .data(&spark_data)
+            .max(64)
+            .style(Style::default().fg(Color::Green))
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        title,
+                        Style::default()
+                            .fg(border_color)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color)),
+            ),
+        area,
+    );
+}
+
+/// Render trend metrics: slope, normalised trend, R², classification.
+#[cfg(feature = "act")]
+fn draw_alpha_trend_metrics(frame: &mut Frame, area: Rect, app: &App) {
+    use muse_rs::alpha_trend::{AlphaTrendPhase, TrendLabel};
+
+    let at = &app.alpha_trend;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(r) = &at.result {
+        // Classification label — big and bold
+        let (label_str, label_color) = match r.label {
+            TrendLabel::Rising => ("▲ RISING", Color::Green),
+            TrendLabel::Flat => ("► FLAT", Color::Yellow),
+            TrendLabel::Falling => ("▼ FALLING", Color::Red),
+        };
+
+        lines.push(Line::from(Span::styled(
+            format!("  {label_str}"),
+            Style::default().fg(label_color).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        // Normalised trend
+        lines.push(Line::from(vec![
+            Span::styled("  Trend: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:+.2} %/min", r.trend_pct_per_min),
+                Style::default().fg(label_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("    (deadband: ±{:.1})", r.deadband),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        // Raw slope
+        lines.push(Line::from(vec![
+            Span::styled("  Slope: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:+.6} /s", r.slope),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("    Mean α: {:.4}", r.mean_alpha),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        // R² — goodness of fit
+        let r2_color = if r.r_squared > 0.5 {
+            Color::Green
+        } else if r.r_squared > 0.2 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        let r2_label = if r.r_squared > 0.5 {
+            "strong"
+        } else if r.r_squared > 0.2 {
+            "moderate"
+        } else {
+            "weak"
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  R²: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:.4}", r.r_squared),
+                Style::default().fg(r2_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  ({r2_label} fit)"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        // Duration and samples
+        lines.push(Line::from(vec![
+            Span::styled("  Duration: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:.0}s", r.duration_s),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("    Samples: {}", r.n_samples),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    } else if at.is_running() {
+        lines.push(Line::from(Span::styled(
+            "  Accumulating data…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Press [i] to start. Runs continuously until you stop it.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Tracks whether frontal alpha power trends up or down over the session.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let border_color = match &at.phase {
+        AlphaTrendPhase::Complete => {
+            if at.result.as_ref().map(|r| r.label) == Some(TrendLabel::Rising) {
+                Color::Green
+            } else if at.result.as_ref().map(|r| r.label) == Some(TrendLabel::Falling) {
+                Color::Red
+            } else {
+                Color::Yellow
+            }
+        }
+        AlphaTrendPhase::Measuring => Color::Green,
+        _ => Color::DarkGray,
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    " Trend Analysis ",
+                    Style::default()
+                        .fg(border_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        ),
+        area,
+    );
+}
+
+/// Render alpha trend controls: deadband, settling, start/stop, key hints.
+#[cfg(feature = "act")]
+fn draw_alpha_trend_controls(frame: &mut Frame, area: Rect, app: &App) {
+    let at = &app.alpha_trend;
+    let deadband = at.config.deadband_pct_per_min;
+    let settling = at.config.settling_duration_s;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(" Deadband: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("±{deadband:.1} %/min"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Settling: ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{settling:.0}s"),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    lines.push(Line::from(Span::styled(
+        " [k/K] deadband ±0.5    [,/.] settling ±5s    [i] start/stop    [e] view",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -4738,6 +5145,10 @@ async fn main() -> Result<()> {
             KeyCode::Char('0') => {
                 app.lock().unwrap().view = ViewMode::Approach;
             }
+            #[cfg(feature = "act")]
+            KeyCode::Char('e') => {
+                app.lock().unwrap().view = ViewMode::AlphaTrend;
+            }
 
             // Bands view: zoom x-axis with [ and ]
             #[cfg(feature = "act")]
@@ -4849,6 +5260,127 @@ async fn main() -> Result<()> {
             KeyCode::Char('H') => {
                 let mut s = app.lock().unwrap();
                 s.approach.config.deadband = (s.approach.config.deadband + 0.02).min(0.50);
+            }
+
+            // Alpha trend measurement start/stop
+            #[cfg(feature = "act")]
+            KeyCode::Char('i') => {
+                let mut s = app.lock().unwrap();
+                if s.alpha_trend.is_running() {
+                    s.alpha_trend.stop();
+                } else {
+                    s.alpha_trend.start();
+                    beep_once();
+                    s.view = ViewMode::AlphaTrend;
+                }
+            }
+
+            // Alpha trend deadband: [k] decrease, [K] increase
+            #[cfg(feature = "act")]
+            KeyCode::Char('k') => {
+                let mut s = app.lock().unwrap();
+                s.alpha_trend.config.deadband_pct_per_min =
+                    (s.alpha_trend.config.deadband_pct_per_min - 0.5).max(0.5);
+            }
+            #[cfg(feature = "act")]
+            KeyCode::Char('K') => {
+                let mut s = app.lock().unwrap();
+                s.alpha_trend.config.deadband_pct_per_min =
+                    (s.alpha_trend.config.deadband_pct_per_min + 0.5).min(20.0);
+            }
+
+            // Settling duration: [,] decrease, [.] increase — context-dependent
+            #[cfg(feature = "act")]
+            KeyCode::Char(',') => {
+                let mut s = app.lock().unwrap();
+                match s.view {
+                    ViewMode::Baseline => {
+                        s.baseline.config.settling_duration_s =
+                            (s.baseline.config.settling_duration_s - 5.0).max(0.0);
+                    }
+                    ViewMode::Absorption => {
+                        s.absorption.config.settling_duration_s =
+                            (s.absorption.config.settling_duration_s - 5.0).max(0.0);
+                    }
+                    ViewMode::Approach => {
+                        s.approach.config.settling_duration_s =
+                            (s.approach.config.settling_duration_s - 1.0).max(0.0);
+                    }
+                    ViewMode::AlphaTrend => {
+                        s.alpha_trend.config.settling_duration_s =
+                            (s.alpha_trend.config.settling_duration_s - 5.0).max(0.0);
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(feature = "act")]
+            KeyCode::Char('.') => {
+                let mut s = app.lock().unwrap();
+                match s.view {
+                    ViewMode::Baseline => {
+                        let max = s.baseline.config.total_duration_s - 5.0;
+                        s.baseline.config.settling_duration_s =
+                            (s.baseline.config.settling_duration_s + 5.0).min(max);
+                    }
+                    ViewMode::Absorption => {
+                        let max = s.absorption.config.measurement_duration_s - 5.0;
+                        s.absorption.config.settling_duration_s =
+                            (s.absorption.config.settling_duration_s + 5.0).min(max);
+                    }
+                    ViewMode::Approach => {
+                        let max = s.approach.config.measurement_duration_s - 5.0;
+                        s.approach.config.settling_duration_s =
+                            (s.approach.config.settling_duration_s + 1.0).min(max);
+                    }
+                    ViewMode::AlphaTrend => {
+                        s.alpha_trend.config.settling_duration_s =
+                            (s.alpha_trend.config.settling_duration_s + 5.0).min(120.0);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Recording duration: [l] decrease, [L] increase — context-dependent
+            #[cfg(feature = "act")]
+            KeyCode::Char('l') => {
+                let mut s = app.lock().unwrap();
+                match s.view {
+                    ViewMode::Baseline => {
+                        let min = s.baseline.config.settling_duration_s + 5.0;
+                        s.baseline.config.total_duration_s =
+                            (s.baseline.config.total_duration_s - 5.0).max(min);
+                    }
+                    ViewMode::Absorption => {
+                        let min = s.absorption.config.settling_duration_s + 5.0;
+                        s.absorption.config.measurement_duration_s =
+                            (s.absorption.config.measurement_duration_s - 5.0).max(min);
+                    }
+                    ViewMode::Approach => {
+                        let min = s.approach.config.settling_duration_s + 5.0;
+                        s.approach.config.measurement_duration_s =
+                            (s.approach.config.measurement_duration_s - 5.0).max(min);
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(feature = "act")]
+            KeyCode::Char('L') => {
+                let mut s = app.lock().unwrap();
+                match s.view {
+                    ViewMode::Baseline => {
+                        s.baseline.config.total_duration_s =
+                            (s.baseline.config.total_duration_s + 5.0).min(300.0);
+                    }
+                    ViewMode::Absorption => {
+                        s.absorption.config.measurement_duration_s =
+                            (s.absorption.config.measurement_duration_s + 5.0).min(300.0);
+                    }
+                    ViewMode::Approach => {
+                        s.approach.config.measurement_duration_s =
+                            (s.approach.config.measurement_duration_s + 5.0).min(300.0);
+                    }
+                    _ => {}
+                }
             }
 
             // Baseline detector start/stop

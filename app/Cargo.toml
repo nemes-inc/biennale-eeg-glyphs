@@ -46,6 +46,11 @@ path = "src/bin/muse_record_fif.rs"
 name = "muse-stream-tcp"
 path = "src/bin/muse_stream_tcp.rs"
 
+# Synthetic EEGF test sender (no headset required).
+[[bin]]
+name = "eegf-test-sender"
+path = "src/bin/eegf_test_sender.rs"
+
 # ── Features ──────────────────────────────────────────────────────────────────
 #
 # tui (default) — pulls in ratatui + crossterm for the terminal UI binary.
