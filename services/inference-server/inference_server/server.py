@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 
+from .admin import start_admin_server
 from .eegm_protocol import (
     ConnectAck,
     ConnectReq,
@@ -61,9 +62,11 @@ class InferenceServer:
         diffusion_steps: int = 50,
         target_channels: list[str] | None = None,
         num_workers: int = DEFAULT_WORKERS,
+        admin_port: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
+        self.admin_port = admin_port if admin_port is not None else port + 1
         self.echo_mode = echo_mode
         self.gpu_device = gpu_device
         self.diffusion_steps = diffusion_steps
@@ -131,6 +134,9 @@ class InferenceServer:
 
         # Start result sender task
         self._send_task = asyncio.create_task(self._send_results())
+
+        # Start admin HTTP server for /status, /restart, /shutdown
+        self._admin_server = await start_admin_server(self, self.admin_port, self.host)
 
         async with self._tcp_server:
             try:
@@ -401,6 +407,9 @@ class InferenceServer:
         if self._send_task is not None:
             self._send_task.cancel()
             self._send_task = None
+        if hasattr(self, "_admin_server") and self._admin_server is not None:
+            self._admin_server.close()
+            self._admin_server = None
         if self._tcp_server is not None:
             self._tcp_server.close()
         # Send poison pills to all workers so they exit cleanly
@@ -459,6 +468,12 @@ def main() -> None:
         help="Comma-separated 10-20 channel names for upsampling (e.g. Fz,Cz,Pz)",
     )
     parser.add_argument(
+        "--admin-port",
+        type=int,
+        default=None,
+        help="Admin HTTP port for /status, /restart, /shutdown (default: TCP port + 1)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -486,6 +501,7 @@ def main() -> None:
         diffusion_steps=args.diffusion_steps,
         target_channels=target_ch,
         num_workers=args.workers,
+        admin_port=args.admin_port,
     )
 
     loop = asyncio.new_event_loop()

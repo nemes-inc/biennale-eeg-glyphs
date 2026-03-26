@@ -2,6 +2,10 @@
 
 ## March 26, 2026
 
+## Admin endpoint for remote restart
+
+Redeploying the inference server meant SSH-ing into the GPU box, killing the process, pulling code, and restarting — which is annoying when you're iterating on timestamp bugs from across the room. The server now runs a zero-dependency HTTP admin endpoint on TCP port + 1 (so 9101 if the main server is on 9100) using raw asyncio. `GET /status` returns JSON stats (uptime, frames, epochs, workers, client connected). `POST /restart` runs `git pull --ff-only` in the repo root, cleanly shuts down all ZUNA workers with poison pills, tears down the mmap job queue, and `os.execv`s the process with the same arguments so it comes back up on the same port with updated code. `POST /shutdown` does the clean teardown without restart. No auth — this is a local network admin tool, not a public API.
+
 ## Timestamp-aligned inference overlay
 
 Reconstructed EEG from the inference server used to just get appended to the end of the plot buffer — so if ZUNA took 30 seconds to process an epoch, the red overlay would show up 30 seconds to the right of where the original data was. Useless for visual comparison. The EEGM wire format now carries a `timestamp_us` field (u64, microseconds) in every frame header, bumping it from 20 to 28 bytes. The Rust BLE loop stamps each outgoing frame with `SystemTime::now()`. The Python server threads that timestamp through the epoch buffer (advancing by hop duration on each 50% overlap), through ZUNA inference, and back out in the response frame. The viewer stores plot data as `[f64; 2]` (time_seconds, amplitude) instead of plain `f32`, computes relative time from the first frame's timestamp, and places reconstructed data at the exact x-position where it was originally captured. If the server sends `timestamp_us=0` (old server, echo mode), the viewer falls back to placing data at the current end of the raw timeline.

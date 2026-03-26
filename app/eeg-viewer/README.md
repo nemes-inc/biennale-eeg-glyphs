@@ -76,6 +76,23 @@ Production mode runs ZUNA diffusion workers on buffered 5-second epochs.
 python -m inference_server.server --port 41820 --workers 8
 ```
 
+### Admin endpoint
+
+The server exposes an HTTP admin endpoint on port + 1 (default: 9101) for remote management.
+
+```bash
+# Server stats
+curl http://192.168.1.101:9101/status
+
+# Pull latest code and restart the process
+curl -X POST http://192.168.1.101:9101/restart
+
+# Clean shutdown
+curl -X POST http://192.168.1.101:9101/shutdown
+```
+
+Override with `--admin-port 8080` if the default conflicts.
+
 ### Connect the viewer
 
 ```bash
