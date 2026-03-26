@@ -365,7 +365,7 @@ def _run_epoch(
             entry = results_accumulator[filename]
             entry["data_original"][sample_idx] = out_orig[i] * eeg_sig_norm
             entry["data_reconstructed"][sample_idx] = out_sig[i] * eeg_sig_norm
-            entry["channel_positions"][sample_idx] = out_pos[i].reshape(-1, tc_val, 3)[:, 0, :]
+            entry["channel_positions"][sample_idx] = out_pos[i]
             entry["collected_samples"] += 1
 
         # Save any complete files immediately
