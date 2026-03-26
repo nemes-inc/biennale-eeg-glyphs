@@ -14,6 +14,14 @@ Per-device recording was a natural consequence of the multi-device split. Each t
 
 Legacy stdin and TCP pipe modes still work unchanged with --stdin or --tcp.
 
+## Outbound channel was silently dead
+
+The BLE-to-server pipeline looked connected but was shipping zero frames. The outbound channel was created inside `connect_to_server()`, but BLE tasks received their sender clone earlier in `connect_device()` — so they got `None` and quietly dropped every frame. Worse, the TCP recv task built a static device map at connect time, meaning any Muse that connected after the server got no routing entry at all. We replaced the `Option<OutboundTx>` with a `SharedOutboundTx` backed by `Arc<Mutex<Option<Sender>>>` so BLE tasks always read the latest sender, and swapped the static device map for a shared `Arc<Mutex<HashMap>>` (the standard Tokio pattern) that updates live as devices connect and disconnect. The status bar "pending" count now actually drains.
+
+## Inference server shutdown was noisy
+
+Ctrl+C on the Python inference server produced a `CancelledError` traceback and a "Task was destroyed but pending" warning because `_send_results` was an orphaned asyncio task. The fix stores the task handle, cancels it explicitly in `shutdown()`, catches `CancelledError` in the coroutine, and drains pending tasks with `asyncio.gather(*pending, return_exceptions=True)` before closing the event loop. Both SIGTERM and SIGINT now exit cleanly with code 0 and zero stderr noise.
+
 ---
 
 # v0.1.0

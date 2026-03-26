@@ -5,6 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use muse_rs::eegm::{EegmFrame, HEADER_SIZE};
 use tokio::sync::mpsc;
 
@@ -12,9 +14,34 @@ use tokio::sync::mpsc;
 pub type OutboundTx = mpsc::UnboundedSender<EegmFrame>;
 pub type OutboundRx = mpsc::UnboundedReceiver<EegmFrame>;
 
-pub fn outbound_channel() -> (OutboundTx, OutboundRx) {
-    mpsc::unbounded_channel()
+/// Shared outbound sender that BLE tasks hold. The inner sender can be
+/// swapped when the server reconnects (new channel, new rx).
+#[derive(Clone)]
+pub struct SharedOutboundTx(Arc<std::sync::Mutex<Option<OutboundTx>>>);
+
+impl SharedOutboundTx {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    /// Replace the inner sender (called when creating a new server connection).
+    /// Returns the new OutboundRx to hand to the TCP client.
+    pub fn reset_channel(&self) -> OutboundRx {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.0.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    /// Try to send a frame. Returns false if no channel is active.
+    pub fn send(&self, frame: EegmFrame) -> bool {
+        if let Some(ref tx) = *self.0.lock().unwrap() {
+            tx.send(frame).is_ok()
+        } else {
+            false
+        }
+    }
 }
+
 
 // ── Brand types ──────────────────────────────────────────────────────────────
 
@@ -771,5 +798,51 @@ mod tests {
         let path = session_file_path(Path::new("/tmp"), "Muse (test)");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.contains("Muse__test_"));
+    }
+
+    // ── SharedOutboundTx ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shared_outbound_tx_send_before_reset_returns_false() {
+        let shared = SharedOutboundTx::new();
+        let frame = make_test_frame(0, 0);
+        assert!(!shared.send(frame), "send should fail when no channel set");
+    }
+
+    #[tokio::test]
+    async fn shared_outbound_tx_send_after_reset_delivers() {
+        let shared = SharedOutboundTx::new();
+        let mut rx = shared.reset_channel();
+        let frame = make_test_frame(0, 42);
+        assert!(shared.send(frame), "send should succeed after reset");
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.epoch_seq, 42);
+    }
+
+    #[tokio::test]
+    async fn shared_outbound_tx_clone_shares_channel() {
+        let shared = SharedOutboundTx::new();
+        let clone = shared.clone();
+        let mut rx = shared.reset_channel();
+
+        // Send through the clone — should arrive on the same rx
+        let frame = make_test_frame(1, 7);
+        assert!(clone.send(frame), "clone should share the channel");
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.headband_id, 1);
+        assert_eq!(received.epoch_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn shared_outbound_tx_reset_replaces_channel() {
+        let shared = SharedOutboundTx::new();
+        let _rx1 = shared.reset_channel();
+
+        // Reset again — old rx is dropped, new one works
+        let mut rx2 = shared.reset_channel();
+        let frame = make_test_frame(0, 99);
+        assert!(shared.send(frame));
+        let received = rx2.recv().await.unwrap();
+        assert_eq!(received.epoch_seq, 99);
     }
 }
