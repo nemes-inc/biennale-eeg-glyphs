@@ -27,7 +27,14 @@ import threading
 import time
 from collections import deque
 
-from .eegm_protocol import EegmFrame, read_frame, write_frame
+from .eegm_protocol import (
+    ConnectAck,
+    ConnectReq,
+    EegmFrame,
+    read_message,
+    write_frame,
+    write_message,
+)
 from .epoch_buffer import EpochBuffer, MAX_HEADBANDS
 from .zuna_worker import InferenceJob, InferenceResult, ZunaWorker
 
@@ -107,20 +114,35 @@ class InferenceServer:
         """Handle one eeg-hub connection."""
         addr = writer.get_extra_info("peername")
         log.info("Hub connected: %s", addr)
-        self._writer = writer
-
-        # Reset buffers for new session
-        for buf in self.buffers:
-            buf.clear()
-        self.frames_received = 0
 
         try:
+            # ── Handshake phase ────────────────────────────────────────
+            if not await self._do_handshake(reader, writer, addr):
+                return
+
+            self._writer = writer
+
+            # Reset buffers for new session
+            for buf in self.buffers:
+                buf.clear()
+            self.frames_received = 0
+
+            # ── Streaming phase ────────────────────────────────────────
             while self._running:
-                frame = await read_frame(reader)
-                if frame is None:
+                msg = await read_message(reader)
+                if msg is None:
                     log.info("Hub disconnected (EOF): %s", addr)
                     break
 
+                if isinstance(msg, ConnectReq):
+                    log.warning("Duplicate ConnectReq from %s — ignoring", addr)
+                    continue
+
+                if not isinstance(msg, EegmFrame):
+                    log.warning("Unexpected message type %s from %s", type(msg).__name__, addr)
+                    continue
+
+                frame = msg
                 self.frames_received += 1
                 hid = frame.headband_id
 
@@ -161,6 +183,62 @@ class InferenceServer:
         finally:
             self._writer = None
             writer.close()
+
+    async def _do_handshake(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        addr,
+    ) -> bool:
+        """Wait for ConnectReq, validate, send ConnectAck.
+
+        Returns True if handshake succeeded and streaming may begin.
+        """
+        try:
+            msg = await asyncio.wait_for(read_message(reader), timeout=10.0)
+        except asyncio.TimeoutError:
+            log.warning("Handshake timeout from %s — closing", addr)
+            writer.close()
+            return False
+
+        if msg is None:
+            log.info("Hub disconnected before handshake: %s", addr)
+            writer.close()
+            return False
+
+        if not isinstance(msg, ConnectReq):
+            log.warning(
+                "Expected ConnectReq from %s, got %s — rejecting",
+                addr,
+                type(msg).__name__,
+            )
+            ack = ConnectAck.error(1)  # 1 = protocol error
+            await write_message(writer, ack)
+            writer.close()
+            return False
+
+        req: ConnectReq = msg
+        log.info(
+            "ConnectReq from %s: version=%d headbands=%d sample_rate=%d",
+            addr,
+            req.protocol_version,
+            req.n_headbands,
+            req.sample_rate,
+        )
+
+        # Validate
+        if req.n_headbands < 1 or req.n_headbands > MAX_HEADBANDS:
+            log.warning("Invalid n_headbands=%d — rejecting", req.n_headbands)
+            ack = ConnectAck.error(2)  # 2 = bad headband count
+            await write_message(writer, ack)
+            writer.close()
+            return False
+
+        # Accept
+        ack = ConnectAck.ok(req.n_headbands, req.sample_rate)
+        await write_message(writer, ack)
+        log.info("Handshake OK — session: %d headband(s) @ %d Hz", req.n_headbands, req.sample_rate)
+        return True
 
     async def _send_results(self) -> None:
         """Send reconstructed frames back to the hub as they arrive."""

@@ -3,13 +3,14 @@
 ## Architecture
 
 ```
-┌──────────────────────────────────┐       TCP (EEGM, bidirectional)      ┌──────────────────────────────┐
+┌──────────────────────────────────┐       TCP (EEGC + EEGM)              ┌──────────────────────────────┐
 │  MacBook — eeg-hub               │ ──────────────────────────────────▶  │  GPU Server — inference-server│
 │                                  │ ◀──────────────────────────────────  │  (Ubuntu + RTX 4090)         │
 │  Muse #1 ─┐                     │                                      │                              │
-│  Muse #2 ─┤ BLE → egui viewer   │   EEGM raw frames ──────────────▶   │  ZUNA model loaded on GPU    │
-│  Muse #3 ─┤   raw + processed   │   EEGM reconstructed frames ◀────   │  Per-headband epoch buffer   │
-│  Muse #4 ─┘   per headband      │                                      │  Async inference pipeline    │
+│  Muse #2 ─┤ BLE → egui viewer   │   1. EEGC ConnectReq ───────────▶   │  ZUNA model loaded on GPU    │
+│  Muse #3 ─┤   raw + processed   │   2. EEGC ConnectAck ◀──────────    │  Per-headband epoch buffer   │
+│  Muse #4 ─┘   per headband      │   3. EEGM raw frames ──────────▶   │  Async inference pipeline    │
+│                                  │   4. EEGM reconstructed ◀──────    │                              │
 └──────────────────────────────────┘                                      └──────────────────────────────┘
 ```
 
@@ -27,9 +28,23 @@ therefore a **delayed asynchronous pipeline**:
 
 ## Components
 
-### 1. EEGM Protocol (`app/src/eegm.rs` + `inference_server/eegm_protocol.py`)
+### 1. Protocol (`app/src/eegm.rs` + `inference_server/eegm_protocol.py`)
 
-Extended EEGF format with headband identification:
+Two message types share the wire, distinguished by their magic bytes:
+
+#### EEGC — Control messages (24 bytes, fixed size)
+
+```
+Offset  Type   Value
+0       u32    Magic: 0x45454743 ("EEGC")
+4       u32    msg_type (1 = CONNECT_REQ, 2 = CONNECT_ACK)
+8       u32    protocol_version (currently 1)
+12      u32    n_headbands (1–4)
+16      u32    sample_rate (e.g. 256)
+20      u32    status (ACK only: 0 = OK, non-zero = error)
+```
+
+#### EEGM — Data frames (20 + payload bytes)
 
 ```
 Offset  Type   Value
@@ -41,18 +56,35 @@ Offset  Type   Value
 20      f32[]  channel-major payload
 ```
 
+#### Connection handshake
+
+```
+Hub                          Server
+ │  ── TCP connect ──────────▶ │
+ │  ── EEGC ConnectReq ──────▶ │  (n_headbands, sample_rate, version)
+ │  ◀── EEGC ConnectAck ────── │  (status=0 → OK, or error code)
+ │  ── EEGM data frames ─────▶ │  (streaming begins)
+ │  ◀── EEGM reconstructed ─── │  (delayed results)
+```
+
+The server enforces a 10-second handshake timeout. If the first message is not
+a `ConnectReq`, or `n_headbands` is out of range, the server replies with a
+non-zero status and closes the connection.
+
 ### 2. eeg-hub (`app/eeg-hub/`)
 
 Rust + egui application:
 - **Multi-BLE**: connects to up to 4 Muse headbands simultaneously
-- **TCP client**: streams EEGM frames to inference server, receives results
+- **TCP client**: performs EEGC handshake, then streams EEGM frames bidirectionally
 - **Viewer**: per-headband panels showing raw traces + reconstructed overlay
+- **Connection status**: UI toolbar shows handshake progress (`Connecting…` → `Handshake…` → `Connected (N band(s), 256 Hz)`)
 - **Scaffolding**: UI team completes the viewer; core plumbing is in place
 
 ### 3. inference-server (`services/inference-server/`)
 
 Python asyncio TCP server:
-- **EEGM parser**: reads frames, routes to per-headband epoch buffers
+- **Handshake**: waits for `ConnectReq`, validates headband count, replies `ConnectAck`
+- **EEGM parser**: reads data frames, routes to per-headband epoch buffers
 - **Epoch buffer**: accumulates 5s windows (1280 samples @ 256 Hz), 50% overlap hop
 - **ZUNA worker thread**: loads model on startup, processes epochs via temp-file shim
   (write .fif → `zuna.preprocessing()` → `zuna.inference()` → `zuna.pt_to_fif()` → read .fif)
@@ -63,7 +95,7 @@ Python asyncio TCP server:
 ### 4. Test tools
 
 - `eegm-test-sender` (`app/src/bin/eegm_test_sender.rs`): synthetic multi-headband
-  EEGM frame generator, connects to inference server, optional response logging
+  EEGM frame generator, performs EEGC handshake then streams, optional response logging
 
 ---
 
@@ -98,7 +130,7 @@ cd app
 ./target/release/eegm-test-sender --target 127.0.0.1:9100 --headbands 2 --read-responses
 ```
 
-You should see frames being sent and echoed back.
+You should see the EEGC handshake logged on both sides, then frames being sent and echoed back.
 
 ### Terminal 1+2 (with eeg-hub)
 ```bash
@@ -153,7 +185,7 @@ The server drops old epochs to stay bounded.
 
 | Phase | Status | Scope |
 |-------|--------|-------|
-| **1** | ✅ Done | EEGM protocol, inference-server skeleton, eeg-hub scaffolding, test sender |
+| **1** | ✅ Done | EEGM/EEGC protocol (data + connect handshake), inference-server skeleton, eeg-hub scaffolding, test sender |
 | **2** | Planned | Single headband end-to-end with GPU inference |
 | **3** | Planned | Multi-headband GPU batching, epoch priority/scheduling |
 | **4** | Planned | UI polish (team), reconnection, latency monitor, recording |
@@ -164,7 +196,7 @@ The server drops old epochs to stay bounded.
 
 ```
 app/
-  src/eegm.rs                          # EEGM protocol (Rust, 5 tests)
+  src/eegm.rs                          # EEGM/EEGC protocol (Rust, 8 tests)
   src/bin/eegm_test_sender.rs           # synthetic EEGM sender
   eeg-hub/
     Cargo.toml

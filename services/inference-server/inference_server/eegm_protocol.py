@@ -20,9 +20,73 @@ import struct
 from dataclasses import dataclass, field
 
 MAGIC_EEGM = 0x4545_474D
+MAGIC_EEGC = 0x4545_4743
 HEADER_SIZE = 20
+CTRL_SIZE = 24
 HEADER_FMT = "<5I"  # 5 × u32 little-endian
+CTRL_FMT = "<6I"   # 6 × u32 little-endian
 MAX_HEADBANDS = 4
+PROTOCOL_VERSION = 1
+
+MSG_CONNECT_REQ = 1
+MSG_CONNECT_ACK = 2
+
+
+@dataclass
+class ConnectReq:
+    """Connection request sent by the hub to the inference server."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    n_headbands: int = 1
+    sample_rate: int = 256
+
+    def encode(self) -> bytes:
+        return struct.pack(
+            CTRL_FMT,
+            MAGIC_EEGC,
+            MSG_CONNECT_REQ,
+            self.protocol_version,
+            self.n_headbands,
+            self.sample_rate,
+            0,  # reserved
+        )
+
+
+@dataclass
+class ConnectAck:
+    """Connection acknowledgement sent by the server back to the hub."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    n_headbands: int = 0
+    sample_rate: int = 0
+    status: int = 0  # 0 = OK, non-zero = error
+
+    @staticmethod
+    def ok(n_headbands: int, sample_rate: int) -> "ConnectAck":
+        return ConnectAck(
+            protocol_version=PROTOCOL_VERSION,
+            n_headbands=n_headbands,
+            sample_rate=sample_rate,
+            status=0,
+        )
+
+    @staticmethod
+    def error(code: int) -> "ConnectAck":
+        return ConnectAck(status=code)
+
+    def is_ok(self) -> bool:
+        return self.status == 0
+
+    def encode(self) -> bytes:
+        return struct.pack(
+            CTRL_FMT,
+            MAGIC_EEGC,
+            MSG_CONNECT_ACK,
+            self.protocol_version,
+            self.n_headbands,
+            self.sample_rate,
+            self.status,
+        )
 
 
 @dataclass
@@ -76,41 +140,82 @@ class EegmFrame:
         return self.data[start : start + self.n_samples]
 
 
-async def read_frame(reader) -> EegmFrame | None:
-    """Read one EEGM frame from an asyncio StreamReader.
+async def read_message(reader) -> ConnectReq | ConnectAck | EegmFrame | None:
+    """Read the next message from an asyncio StreamReader.
 
+    Dispatches on the magic bytes (EEGC for control, EEGM for data).
     Returns ``None`` on clean EOF.
     """
-    header_bytes = await reader.read(HEADER_SIZE)
-    if len(header_bytes) == 0:
+    magic_bytes = await reader.read(4)
+    if len(magic_bytes) == 0:
         return None
-    if len(header_bytes) < HEADER_SIZE:
-        raise IOError(f"truncated EEGM header ({len(header_bytes)} bytes)")
+    if len(magic_bytes) < 4:
+        raise IOError(f"truncated magic ({len(magic_bytes)} bytes)")
 
-    magic, headband_id, epoch_seq, n_channels, n_samples = struct.unpack(
-        HEADER_FMT, header_bytes
-    )
-    if magic != MAGIC_EEGM:
-        raise IOError(f"bad EEGM magic: 0x{magic:08X} (expected 0x{MAGIC_EEGM:08X})")
-    if n_channels > 64 or n_samples > 65536:
-        raise IOError(
-            f"implausible EEGM dimensions: {n_channels} ch × {n_samples} samples"
+    (magic,) = struct.unpack("<I", magic_bytes)
+
+    if magic == MAGIC_EEGC:
+        rest = await reader.readexactly(CTRL_SIZE - 4)
+        msg_type, version, n_headbands, sample_rate, status = struct.unpack(
+            "<5I", rest
+        )
+        if msg_type == MSG_CONNECT_REQ:
+            return ConnectReq(
+                protocol_version=version,
+                n_headbands=n_headbands,
+                sample_rate=sample_rate,
+            )
+        elif msg_type == MSG_CONNECT_ACK:
+            return ConnectAck(
+                protocol_version=version,
+                n_headbands=n_headbands,
+                sample_rate=sample_rate,
+                status=status,
+            )
+        else:
+            raise IOError(f"unknown EEGC msg_type: {msg_type}")
+
+    elif magic == MAGIC_EEGM:
+        hdr_rest = await reader.readexactly(HEADER_SIZE - 4)
+        headband_id, epoch_seq, n_channels, n_samples = struct.unpack(
+            "<4I", hdr_rest
+        )
+        if n_channels > 64 or n_samples > 65536:
+            raise IOError(
+                f"implausible EEGM dimensions: {n_channels} ch × {n_samples} samples"
+            )
+        payload_size = n_channels * n_samples * 4
+        payload_bytes = await reader.readexactly(payload_size)
+        data = list(struct.unpack(f"<{n_channels * n_samples}f", payload_bytes))
+        return EegmFrame(
+            headband_id=headband_id,
+            epoch_seq=epoch_seq,
+            n_channels=n_channels,
+            n_samples=n_samples,
+            data=data,
         )
 
-    payload_size = n_channels * n_samples * 4
-    payload_bytes = await reader.readexactly(payload_size)
-    data = list(struct.unpack(f"<{n_channels * n_samples}f", payload_bytes))
+    else:
+        raise IOError(f"unknown magic: 0x{magic:08X} (expected EEGM or EEGC)")
 
-    return EegmFrame(
-        headband_id=headband_id,
-        epoch_seq=epoch_seq,
-        n_channels=n_channels,
-        n_samples=n_samples,
-        data=data,
-    )
+
+async def read_frame(reader) -> EegmFrame | None:
+    """Read one EEGM data frame (legacy helper, skips control messages)."""
+    msg = await read_message(reader)
+    if msg is None:
+        return None
+    if isinstance(msg, EegmFrame):
+        return msg
+    raise IOError(f"expected EegmFrame, got {type(msg).__name__}")
+
+
+async def write_message(writer, msg: ConnectReq | ConnectAck | EegmFrame) -> None:
+    """Write any EEGM/EEGC message to an asyncio StreamWriter."""
+    writer.write(msg.encode())
+    await writer.drain()
 
 
 async def write_frame(writer, frame: EegmFrame) -> None:
-    """Write one EEGM frame to an asyncio StreamWriter."""
+    """Write one EEGM data frame to an asyncio StreamWriter."""
     writer.write(frame.encode())
     await writer.drain()

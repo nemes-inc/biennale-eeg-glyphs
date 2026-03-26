@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use muse_rs::eegm::{EegmFrame, HEADER_SIZE, MAGIC_EEGM};
+use muse_rs::eegm::{ConnectReq, EegmFrame, CTRL_SIZE, HEADER_SIZE, MAGIC_EEGC, MAGIC_EEGM};
 
 /// Simulated sample rate (Muse = 256 Hz).
 const SAMPLE_RATE: f64 = 256.0;
@@ -110,8 +110,29 @@ fn main() -> Result<()> {
     let mut stream = TcpStream::connect(&args.target)
         .context(format!("TCP connect to {}", args.target))?;
     stream.set_nodelay(true).ok();
+
+    // ── Handshake ────────────────────────────────────────────────────────
+    let req = ConnectReq::new(n_headbands as u32, SAMPLE_RATE as u32);
+    stream.write_all(&req.encode()).context("send ConnectReq")?;
+    stream.flush().ok();
+    log::info!("ConnectReq sent ({n_headbands} headband(s), {} Hz). Waiting for ack…", SAMPLE_RATE as u32);
+
+    let mut ack_buf = [0u8; CTRL_SIZE];
+    stream.read_exact(&mut ack_buf).context("read ConnectAck")?;
+    let ack_magic = u32::from_le_bytes([ack_buf[0], ack_buf[1], ack_buf[2], ack_buf[3]]);
+    if ack_magic != MAGIC_EEGC {
+        anyhow::bail!("expected EEGC ConnectAck, got 0x{ack_magic:08X}");
+    }
+    let ack_status = u32::from_le_bytes([ack_buf[20], ack_buf[21], ack_buf[22], ack_buf[23]]);
+    if ack_status != 0 {
+        anyhow::bail!("server rejected connection: status={ack_status}");
+    }
+    let ack_hb = u32::from_le_bytes([ack_buf[12], ack_buf[13], ack_buf[14], ack_buf[15]]);
+    let ack_sr = u32::from_le_bytes([ack_buf[16], ack_buf[17], ack_buf[18], ack_buf[19]]);
+    log::info!("ConnectAck OK — server accepted {ack_hb} headband(s) @ {ack_sr} Hz");
+
     log::info!(
-        "Connected. Streaming {} headband(s), chunk={chunk}.",
+        "Streaming {} headband(s), chunk={chunk}.",
         n_headbands
     );
 

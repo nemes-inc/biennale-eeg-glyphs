@@ -326,8 +326,9 @@ fn main() {
             let (tx, rx) = tcp_client::outbound_channel();
             let state_tcp = Arc::clone(&state);
             let addr = addr.clone();
+            let n_hb = n_headbands as u32;
             rt.spawn(async move {
-                let _ = tcp_client::spawn_tcp_client(addr, state_tcp, rx).await;
+                let _ = tcp_client::spawn_tcp_client(addr, n_hb, 256, state_tcp, rx).await;
             });
             Some(tx)
         } else {
