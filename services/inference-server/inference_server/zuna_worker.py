@@ -2,22 +2,24 @@
 ZUNA GPU inference worker.
 
 Runs in a dedicated thread/process.  Receives epochs from an asyncio queue,
-batches them, runs the ZUNA pipeline (preprocess → inference → reconstruct),
+batches them, runs the ZUNA pipeline (preprocess -> inference -> reconstruct),
 and pushes reconstructed frames into an output queue.
 
 Since ZUNA's public API is file-based, we use a temp-directory shim:
-  1. Write epoch → temp .fif (MNE RawArray)
-  2. Call ``zuna.preprocessing()`` → .pt
-  3. Call ``zuna.inference()`` → .pt
-  4. Call ``zuna.pt_to_fif()`` → .fif
-  5. Read reconstructed .fif → extract samples → return
+  1. Write epoch -> temp .fif (MNE RawArray)
+  2. Call ``zuna.preprocessing()`` -> .pt
+  3. Inference via persistent subprocess -> .pt
+  4. Call ``zuna.pt_to_fif()`` -> .fif
+  5. Read reconstructed .fif -> extract samples -> return
 
-This adds disk I/O overhead but is the only path available with the public API.
-A future optimisation could call the model's forward pass directly.
+The inference step uses a **persistent subprocess** that keeps the model
+loaded in GPU memory between epochs, eliminating ~15 s of startup overhead
+per epoch (NCCL init, HuggingFace weight load, torch.compile).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -42,8 +44,12 @@ EPOCH_SECONDS = 5
 # Muse 4-channel names matching standard_1020
 MUSE_CHANNEL_NAMES = ["TP9", "AF7", "AF8", "TP10"]
 
-# Serialize inference() calls so workers don't race on MASTER_PORT / GPU.
+# Serialize inference() calls so workers don't race on GPU.
 _inference_lock = threading.Lock()
+
+# Module-level persistent inference subprocess (shared by all workers).
+_persistent_proc: subprocess.Popen | None = None
+_persistent_ready = False
 
 
 def _pick_free_port() -> int:
@@ -94,10 +100,16 @@ class ZunaWorker:
         self._model_loaded = False
 
     def load_model(self) -> None:
-        """Import zuna and trigger weight download (first run)."""
+        """Import zuna and start the persistent inference subprocess (once)."""
         log.info("Loading ZUNA model (weights download on first run) …")
-        # Import triggers model weight download via HuggingFace
         import zuna  # noqa: F401
+
+        # Start the persistent subprocess exactly once (first worker wins).
+        _ensure_persistent_subprocess(
+            gpu_device=self.gpu_device,
+            diffusion_steps=self.diffusion_steps,
+            tokens_per_batch=self.tokens_per_batch,
+        )
 
         self._model_loaded = True
         log.info("ZUNA model ready.")
@@ -186,10 +198,13 @@ class ZunaWorker:
             )
             return None
 
-        # Serialize: workers share os.environ and a single GPU.
+        # Serialize: workers share a single persistent GPU subprocess.
         with _inference_lock:
-            self._run_inference_subprocess(
-                pt_in=pt_in, pt_out=pt_out, work=work, zuna_pkg=zuna,
+            _send_inference_request(
+                input_dir=str(pt_in.absolute()),
+                output_dir=str(pt_out.absolute()),
+                diffusion_steps=self.diffusion_steps,
+                tokens_per_batch=self.tokens_per_batch,
             )
 
         # ── 4. Reconstruct .pt → .fif ────────────────────────────────────
@@ -217,49 +232,147 @@ class ZunaWorker:
             channels=out_channels,
         )
 
-    def _run_inference_subprocess(
-        self,
-        pt_in: Path,
-        pt_out: Path,
-        work: Path,
-        zuna_pkg,
-    ) -> None:
-        """Run ZUNA inference via our shim to work around hardcoded MASTER_PORT.
 
-        Instead of calling ``zuna.inference()`` (which spawns a subprocess
-        that hits a hardcoded port in lingua), we build the same command but
-        route it through ``_inference_shim.py``.  The shim monkey-patches
-        ``torch.distributed.init_process_group`` to use our chosen port.
-        """
-        zuna_root = Path(zuna_pkg.__file__).parent
-        eeg_eval_script = (
-            zuna_root / "inference/AY2l/lingua/apps/AY2latent_bci/eeg_eval.py"
-        )
+# ── Persistent inference subprocess management ──────────────────────────
+
+
+def _ensure_persistent_subprocess(
+    gpu_device: int | str = 0,
+    diffusion_steps: int = 50,
+    tokens_per_batch: int = 1000,
+) -> None:
+    """Start the persistent inference subprocess if it isn't running yet."""
+    global _persistent_proc, _persistent_ready
+
+    with _inference_lock:
+        if _persistent_proc is not None and _persistent_proc.poll() is None:
+            # Already running
+            return
+
+        import zuna
+        zuna_root = Path(zuna.__file__).parent
         config_path = (
-            zuna_root / "inference/AY2l/lingua/apps/AY2latent_bci/configs/config_infer.yaml"
+            zuna_root
+            / "inference/AY2l/lingua/apps/AY2latent_bci/configs/config_infer.yaml"
         )
-        shim_script = Path(__file__).parent / "_inference_shim.py"
-
-        pt_out.mkdir(parents=True, exist_ok=True)
+        script_dir = str(
+            zuna_root / "inference/AY2l/lingua/apps/AY2latent_bci"
+        )
+        shim_script = str(Path(__file__).parent / "_inference_shim.py")
+        persistent_script = str(Path(__file__).parent / "_persistent_inference.py")
 
         cmd = [
             sys.executable,
-            str(shim_script),
-            str(eeg_eval_script),
+            shim_script,
+            persistent_script,
             f"config={config_path}",
-            f"data.data_dir={pt_in.absolute()}",
-            f"data.export_dir={pt_out.absolute()}",
-            f"diffusion_cfg=1.0",
-            f"diffusion_sample_steps={self.diffusion_steps}",
-            f"plot_eeg_signal_samples=False",
-            f"inference_figures_dir={work / 'FIGURES'}",
-            f"data.target_packed_seqlen={self.tokens_per_batch}",
+            f"diffusion_sample_steps={diffusion_steps}",
+            f"data.target_packed_seqlen={tokens_per_batch}",
             f"data.data_norm=10.0",
+            f"plot_eeg_signal_samples=False",
         ]
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_device)
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_device)
         env["MASTER_ADDR"] = "127.0.0.1"
         env["_INFERENCE_MASTER_PORT"] = str(_pick_free_port())
+        # Ensure the eeg_eval sibling modules are importable
+        env["PYTHONPATH"] = script_dir + os.pathsep + env.get("PYTHONPATH", "")
 
-        subprocess.run(cmd, env=env, check=True)
+        log.info("Starting persistent inference subprocess …")
+        _persistent_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,  # inherit parent stderr so logs are visible
+            env=env,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+
+        # Wait for the "ready" message (model loaded)
+        log.info("Waiting for persistent inference subprocess to load model …")
+        ready_line = _persistent_proc.stdout.readline()
+        if not ready_line:
+            rc = _persistent_proc.wait()
+            raise RuntimeError(
+                f"Persistent inference subprocess exited immediately (rc={rc})"
+            )
+        msg = json.loads(ready_line)
+        if msg.get("status") != "ready":
+            raise RuntimeError(
+                f"Unexpected first message from persistent subprocess: {msg}"
+            )
+        _persistent_ready = True
+        log.info("Persistent inference subprocess ready.")
+
+
+def _send_inference_request(
+    input_dir: str,
+    output_dir: str,
+    diffusion_steps: int = 50,
+    tokens_per_batch: int = 1000,
+) -> None:
+    """Send one inference request to the persistent subprocess.
+
+    Must be called while holding ``_inference_lock``.
+    """
+    global _persistent_proc, _persistent_ready
+
+    if _persistent_proc is None or _persistent_proc.poll() is not None:
+        raise RuntimeError("Persistent inference subprocess is not running")
+
+    request = json.dumps({
+        "input_dir": input_dir,
+        "output_dir": output_dir,
+        "diffusion_sample_steps": diffusion_steps,
+        "tokens_per_batch": tokens_per_batch,
+    })
+    _persistent_proc.stdin.write(request + "\n")
+    _persistent_proc.stdin.flush()
+
+    # Block until the subprocess replies
+    response_line = _persistent_proc.stdout.readline()
+    if not response_line:
+        rc = _persistent_proc.poll()
+        _persistent_ready = False
+        raise RuntimeError(
+            f"Persistent inference subprocess died (rc={rc})"
+        )
+
+    resp = json.loads(response_line)
+    if resp.get("status") == "ok":
+        log.info(
+            "Inference completed in %.1fs (persistent subprocess)",
+            resp.get("elapsed", 0),
+        )
+    else:
+        raise RuntimeError(
+            f"Persistent inference failed: {resp.get('msg', resp)}"
+        )
+
+
+def shutdown_persistent_subprocess() -> None:
+    """Gracefully shut down the persistent inference subprocess."""
+    global _persistent_proc, _persistent_ready
+
+    with _inference_lock:
+        if _persistent_proc is None:
+            return
+        if _persistent_proc.poll() is not None:
+            _persistent_proc = None
+            _persistent_ready = False
+            return
+
+        try:
+            _persistent_proc.stdin.write(
+                json.dumps({"command": "shutdown"}) + "\n"
+            )
+            _persistent_proc.stdin.flush()
+            _persistent_proc.wait(timeout=30)
+        except Exception:
+            log.warning("Killing persistent inference subprocess")
+            _persistent_proc.kill()
+        finally:
+            _persistent_proc = None
+            _persistent_ready = False

@@ -38,7 +38,7 @@ from .eegm_protocol import (
 )
 from .epoch_buffer import EpochBuffer, MAX_HEADBANDS, EPOCH_SAMPLES, NUM_MUSE_CHANNELS
 from .mmap_queue import MmapJobQueue
-from .zuna_worker import InferenceJob, InferenceResult, ZunaWorker
+from .zuna_worker import InferenceJob, InferenceResult, ZunaWorker, shutdown_persistent_subprocess
 
 log = logging.getLogger(__name__)
 
@@ -410,6 +410,8 @@ class InferenceServer:
                 pass
         # Clean up the mmap backing file
         self._job_queue.close()
+        # Shut down the persistent inference subprocess
+        shutdown_persistent_subprocess()
 
 
 def main() -> None:
