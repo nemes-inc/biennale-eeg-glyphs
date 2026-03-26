@@ -119,6 +119,12 @@ struct SharedState {
     muse_ble_retry_pending: bool,
     /// Channel names from `fif_pair_to_eegd.py` NAMES: header.
     channel_names: Option<Vec<String>>,
+    /// True while the Record toggle is active (accumulating TCP/stdin data).
+    recording_active: bool,
+    /// Separate accumulation buffer for recording (not trimmed like the rolling plot buffer).
+    record_buffer: Vec<Vec<f32>>,
+    /// Number of aligned samples accumulated so far.
+    record_sample_count: usize,
 }
 
 struct EegViewerApp {
@@ -128,7 +134,7 @@ struct EegViewerApp {
     show_original: bool,
     /// Draw reconstructed trace in red when EEGD data is present.
     show_reconstructed: bool,
-    /// Duration in seconds for Record / Preprocess.
+    /// Duration in seconds for Record / Preprocess (BLE mode only).
     record_secs: u32,
     zuna_dir: PathBuf,
     muse_record_bin: PathBuf,
@@ -148,6 +154,14 @@ struct EegViewerApp {
     pipeline_step: Option<(u8, u8)>,
     pipeline_label: String,
     resume_muse_pending: bool,
+    /// Path to the last saved FIF from a TCP recording session.
+    last_recording_fif: Option<PathBuf>,
+    /// When the current TCP recording started.
+    record_started_at: Option<Instant>,
+    /// Debounce guard for Record/Stop toggle.
+    last_record_toggle: Option<Instant>,
+    /// True when Reset confirmation is pending.
+    reset_confirm_pending: bool,
 }
 
 /// Job events from background Record / Preprocess threads.
@@ -282,17 +296,153 @@ impl EegViewerApp {
         *self.muse_live.lock().unwrap() = Some(h);
     }
 
-    fn start_record_only(&mut self) {
+    /// TCP/stdin: toggle recording on/off with debounce.
+    fn toggle_tcp_recording(&mut self) {
+        // Debounce: ignore clicks within 500 ms of last toggle.
+        if let Some(t) = self.last_record_toggle {
+            if t.elapsed() < Duration::from_millis(500) {
+                return;
+            }
+        }
+        self.last_record_toggle = Some(Instant::now());
+
+        let is_recording = self.state.lock().unwrap().recording_active;
+        if is_recording {
+            self.stop_and_save_tcp_recording();
+        } else {
+            // Start recording: clear buffer, set flag.
+            {
+                let mut st = self.state.lock().unwrap();
+                st.record_buffer.clear();
+                st.record_sample_count = 0;
+                st.recording_active = true;
+            }
+            self.record_started_at = Some(Instant::now());
+            self.last_recording_fif = None;
+            self.reset_confirm_pending = false;
+            self.job_log.clear();
+            self.muse_status = "Recording…".to_string();
+        }
+    }
+
+    /// Stop TCP recording and save buffer → CSV → FIF in a background thread.
+    fn stop_and_save_tcp_recording(&mut self) {
+        // Stop accumulation immediately.
+        self.state.lock().unwrap().recording_active = false;
+
+        if self.job_busy {
+            return;
+        }
+
+        let state = Arc::clone(&self.state);
+        let mne_script = self.zuna_dir.join("muse_eeg_to_fif.py");
+        let zuna_dir = self.zuna_dir.clone();
+        let out = capture_fif_path(&self.zuna_dir);
+        let out_clone = out.clone();
+        let (tx, rx) = mpsc::channel();
+        self.job_rx = Some(rx);
+        self.job_busy = true;
+        self.job_started_at = Some(Instant::now());
+        self.job_last_duration = None;
+        self.pipeline_step = None;
+        self.pipeline_label.clear();
+        self.job_log = format!("Saving recording → {} …\n", out.display());
+
+        thread::spawn(move || {
+            // Take the record buffer out of SharedState (avoids holding lock during I/O).
+            let (channels, n) = {
+                let mut st = state.lock().unwrap();
+                let buf = std::mem::take(&mut st.record_buffer);
+                let n = st.record_sample_count;
+                st.record_sample_count = 0;
+                (buf, n)
+            };
+
+            if channels.is_empty() || channels.len() < 4 || n < 256 {
+                let _ = tx.send(JobEvent::LogLine(format!(
+                    "Recording too short ({n} samples). Need at least ~1 s at 256 Hz.\n"
+                )));
+                let _ = tx.send(JobEvent::Done { ok: false, pipeline_loaded: false, preprocess: false });
+                return;
+            }
+
+            // Write CSV
+            let csv_path = std::env::temp_dir().join(format!(
+                "tcp_eeg_{}.csv",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ));
+            let csv_result = (|| -> Result<(), String> {
+                use std::io::Write;
+                let f = std::fs::File::create(&csv_path)
+                    .map_err(|e| format!("create {}: {e}", csv_path.display()))?;
+                let mut w = std::io::BufWriter::new(f);
+                writeln!(w, "TP9,AF7,AF8,TP10").map_err(|e| e.to_string())?;
+                for i in 0..n {
+                    writeln!(w, "{},{},{},{}", channels[0][i], channels[1][i], channels[2][i], channels[3][i])
+                        .map_err(|e| e.to_string())?;
+                }
+                w.flush().map_err(|e| e.to_string())?;
+                Ok(())
+            })();
+
+            if let Err(e) = csv_result {
+                let _ = tx.send(JobEvent::LogLine(format!("CSV write failed: {e}\n")));
+                let _ = tx.send(JobEvent::Done { ok: false, pipeline_loaded: false, preprocess: false });
+                return;
+            }
+
+            // Convert CSV → FIF
+            let venv_py = zuna_dir.join(".venv/bin/python");
+            let python = if venv_py.is_file() { venv_py.to_string_lossy().into_owned() } else { "python3".into() };
+
+            let result = Command::new(&python)
+                .arg(&mne_script)
+                .arg("--csv").arg(&csv_path)
+                .arg("-o").arg(&out)
+                .arg("--sfreq").arg("256")
+                .output();
+            let _ = std::fs::remove_file(&csv_path);
+
+            match result {
+                Ok(o) if o.status.success() => {
+                    let dur_s = n as f64 / 256.0;
+                    let _ = tx.send(JobEvent::LogLine(format!(
+                        "Saved {n} samples × 4 ch ({dur_s:.1} s) → {}\n",
+                        out.display()
+                    )));
+                    let _ = tx.send(JobEvent::Done { ok: true, pipeline_loaded: false, preprocess: false });
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let _ = tx.send(JobEvent::LogLine(format!("FIF conversion failed:\n{stderr}\n")));
+                    let _ = tx.send(JobEvent::Done { ok: false, pipeline_loaded: false, preprocess: false });
+                }
+                Err(e) => {
+                    let _ = tx.send(JobEvent::LogLine(format!("spawn {python}: {e}\n")));
+                    let _ = tx.send(JobEvent::Done { ok: false, pipeline_loaded: false, preprocess: false });
+                }
+            }
+        });
+
+        self.last_recording_fif = Some(out_clone);
+        self.record_started_at = None;
+    }
+
+    /// BLE-mode record (unchanged legacy path).
+    fn start_record_only_ble(&mut self) {
         if self.job_busy {
             return;
         }
         let state = Arc::clone(&self.state);
         let muse_live = Arc::clone(&self.muse_live);
         let max_points = self.max_points;
-        let input_kind = self.input_kind;
         let bin = self.muse_record_bin.clone();
         let mne_script = self.zuna_dir.join("muse_eeg_to_fif.py");
         let out = capture_fif_path(&self.zuna_dir);
+        let out_for_closure = out.clone();
         let secs = self.record_secs.max(1);
         let (tx, rx) = mpsc::channel();
         self.job_rx = Some(rx);
@@ -303,43 +453,65 @@ impl EegViewerApp {
         self.pipeline_label.clear();
         self.resume_muse_pending = false;
         self.job_log = format!("Recording {secs}s → {} …", out.display());
+        self.last_recording_fif = Some(out);
         thread::spawn(move || {
-            if input_kind == InputKind::MuseBle {
-                stop_muse_if_any(&muse_live);
-            }
-            match run_muse_record(&bin, &out, secs as u64, &mne_script) {
+            stop_muse_if_any(&muse_live);
+            match run_muse_record(&bin, &out_for_closure, secs as u64, &mne_script) {
                 Ok(s) => {
                     let _ = tx.send(JobEvent::LogLine(format!("--- Recording ---\n{s}")));
-                    if input_kind == InputKind::MuseBle {
-                        let h = muse_ble::spawn_muse_ble_thread(Arc::clone(&state), max_points);
-                        *muse_live.lock().unwrap() = Some(h);
-                    }
-                    let _ = tx.send(JobEvent::Done {
-                        ok: true,
-                        pipeline_loaded: false,
-                        preprocess: false,
-                    });
+                    let h = muse_ble::spawn_muse_ble_thread(Arc::clone(&state), max_points);
+                    *muse_live.lock().unwrap() = Some(h);
+                    let _ = tx.send(JobEvent::Done { ok: true, pipeline_loaded: false, preprocess: false });
                 }
                 Err(e) => {
                     let _ = tx.send(JobEvent::LogLine(format!("Recording failed:\n{e}")));
-                    if input_kind == InputKind::MuseBle {
-                        let h = muse_ble::spawn_muse_ble_thread(Arc::clone(&state), max_points);
-                        *muse_live.lock().unwrap() = Some(h);
-                    }
-                    let _ = tx.send(JobEvent::Done {
-                        ok: false,
-                        pipeline_loaded: false,
-                        preprocess: false,
-                    });
+                    let h = muse_ble::spawn_muse_ble_thread(Arc::clone(&state), max_points);
+                    *muse_live.lock().unwrap() = Some(h);
+                    let _ = tx.send(JobEvent::Done { ok: false, pipeline_loaded: false, preprocess: false });
                 }
             }
         });
+    }
+
+    /// Reset: drop recorded session, clear state.
+    fn reset_recording(&mut self) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.recording_active = false;
+            st.record_buffer.clear();
+            st.record_sample_count = 0;
+        }
+        self.last_recording_fif = None;
+        self.record_started_at = None;
+        self.reset_confirm_pending = false;
+        self.job_log.clear();
+        self.muse_status = match self.input_kind {
+            InputKind::Tcp => "Batch: idle (plot from TCP)".to_string(),
+            InputKind::Stdin => "Batch: idle (plot from stdin)".to_string(),
+            InputKind::MuseBle => "Muse BLE: streaming".to_string(),
+            InputKind::None => "Batch: idle".to_string(),
+        };
     }
 
     fn start_preprocess(&mut self) {
         if self.job_busy {
             return;
         }
+        let is_tcp_or_stdin = matches!(self.input_kind, InputKind::Tcp | InputKind::Stdin);
+
+        // In TCP mode, require a saved recording first.
+        let fif_path = if is_tcp_or_stdin {
+            match self.last_recording_fif.clone() {
+                Some(p) if p.is_file() => p,
+                _ => {
+                    self.muse_status = "No recording to preprocess. Record first, then Preprocess.".to_string();
+                    return;
+                }
+            }
+        } else {
+            capture_fif_path(&self.zuna_dir)
+        };
+
         let state = Arc::clone(&self.state);
         let muse_live = Arc::clone(&self.muse_live);
         let max_points = self.max_points;
@@ -347,7 +519,7 @@ impl EegViewerApp {
         let bin = self.muse_record_bin.clone();
         let zuna_dir = self.zuna_dir.clone();
         let mne_script = self.zuna_dir.join("muse_eeg_to_fif.py");
-        let out = capture_fif_path(&self.zuna_dir);
+        let out = fif_path;
         let basename = out
             .file_name()
             .and_then(|s| s.to_str())
@@ -363,27 +535,34 @@ impl EegViewerApp {
         self.pipeline_step = None;
         self.pipeline_label.clear();
         self.resume_muse_pending = false;
-        self.job_log = format!("Recording {secs}s, then ZUNA pipeline (--preset {preset})…\n");
+        self.job_log = if is_tcp_or_stdin {
+            format!("ZUNA pipeline on {} (--preset {preset})…\n", out.display())
+        } else {
+            format!("Recording {secs}s, then ZUNA pipeline (--preset {preset})…\n")
+        };
         thread::spawn(move || {
-            if input_kind == InputKind::MuseBle {
-                stop_muse_if_any(&muse_live);
-            }
-            match run_muse_record(&bin, &out, secs as u64, &mne_script) {
-                Ok(s) => {
-                    let _ = tx.send(JobEvent::LogLine(format!("--- Recording ---\n{s}\n")));
+            // In BLE mode, record first. In TCP mode the FIF already exists.
+            if !is_tcp_or_stdin {
+                if input_kind == InputKind::MuseBle {
+                    stop_muse_if_any(&muse_live);
                 }
-                Err(e) => {
-                    let _ = tx.send(JobEvent::LogLine(format!("Recording failed:\n{e}")));
-                    if input_kind == InputKind::MuseBle {
-                        let h = muse_ble::spawn_muse_ble_thread(Arc::clone(&state), max_points);
-                        *muse_live.lock().unwrap() = Some(h);
+                match run_muse_record(&bin, &out, secs as u64, &mne_script) {
+                    Ok(s) => {
+                        let _ = tx.send(JobEvent::LogLine(format!("--- Recording ---\n{s}\n")));
                     }
-                    let _ = tx.send(JobEvent::Done {
-                        ok: false,
-                        pipeline_loaded: false,
-                        preprocess: true,
-                    });
-                    return;
+                    Err(e) => {
+                        let _ = tx.send(JobEvent::LogLine(format!("Recording failed:\n{e}")));
+                        if input_kind == InputKind::MuseBle {
+                            let h = muse_ble::spawn_muse_ble_thread(Arc::clone(&state), max_points);
+                            *muse_live.lock().unwrap() = Some(h);
+                        }
+                        let _ = tx.send(JobEvent::Done {
+                            ok: false,
+                            pipeline_loaded: false,
+                            preprocess: true,
+                        });
+                        return;
+                    }
                 }
             }
             let input_str = out.to_string_lossy().into_owned();
@@ -792,6 +971,8 @@ impl eframe::App for EegViewerApp {
             tcp_connected,
             muse_ble_streaming,
             muse_ble_retry_pending,
+            recording_active,
+            record_sample_count,
         ) = {
             let st = self.state.lock().unwrap();
             let has = !st.channels_recon.is_empty()
@@ -804,8 +985,13 @@ impl eframe::App for EegViewerApp {
                 st.tcp_client_connected,
                 st.muse_ble_streaming,
                 st.muse_ble_retry_pending,
+                st.recording_active,
+                st.record_sample_count,
             )
         };
+
+        let is_tcp_or_stdin = matches!(self.input_kind, InputKind::Tcp | InputKind::Stdin);
+        let has_saved_recording = self.last_recording_fif.as_ref().map_or(false, |p| p.is_file());
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -813,44 +999,111 @@ impl eframe::App for EegViewerApp {
                     "When off, live streaming (Muse / stdin / TCP) is hidden. A loaded ZUNA comparison (original vs reconstructed) still appears.",
                 );
                 ui.separator();
-                ui.label("Duration (s):");
-                ui.add(
-                    egui::DragValue::new(&mut self.record_secs)
-                        .range(1..=3600)
-                        .speed(1.0),
-                );
-                ui.separator();
-                ui.label("ZUNA preset:");
-                if ui
-                    .add_enabled(!self.job_busy, egui::Button::new("Record"))
-                    .on_hover_text(
-                        "Record from Muse → services/zuna/live_captures/live_<time>.fif (needs muse-record-fif)",
-                    )
-                    .clicked()
-                {
-                    self.start_record_only();
-                }
-                ui.separator();
-                egui::ComboBox::from_id_salt("zuna_preset")
-                    .selected_text(self.zuna_preset.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.zuna_preset, ZunaPreset::None, ZunaPreset::None.label());
-                        ui.selectable_value(&mut self.zuna_preset, ZunaPreset::Ch8, ZunaPreset::Ch8.label());
-                        ui.selectable_value(
-                            &mut self.zuna_preset,
-                            ZunaPreset::Ch10,
-                            ZunaPreset::Ch10.label(),
+
+                if is_tcp_or_stdin {
+                    // ── TCP/stdin mode: Record/Stop toggle ──
+                    if recording_active {
+                        let elapsed = self.record_started_at
+                            .map(|t| format_duration(t.elapsed()))
+                            .unwrap_or_else(|| "…".into());
+                        let samples_str = if record_sample_count > 0 {
+                            format!(" — {} samples", record_sample_count)
+                        } else {
+                            String::new()
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(format!("■ Stop ({elapsed}{samples_str})"))
+                                .color(egui::Color32::from_rgb(220, 50, 50)),
                         );
-                    });
-                if ui
-                    .add_enabled(!self.job_busy, egui::Button::new("Preprocess"))
-                    .on_hover_text(
-                        "Record for the duration above, then run ZUNA run_fif_pipeline.py (preset from menu)",
-                    )
-                    .clicked()
-                {
-                    self.start_preprocess();
+                        if ui.add_enabled(!self.job_busy, btn)
+                            .on_hover_text("Stop recording and save to FIF")
+                            .clicked()
+                        {
+                            self.toggle_tcp_recording();
+                        }
+                    } else {
+                        let btn = egui::Button::new("● Record");
+                        if ui.add_enabled(!self.job_busy && !recording_active, btn)
+                            .on_hover_text("Start recording TCP stream. Click Stop to save.")
+                            .clicked()
+                        {
+                            self.toggle_tcp_recording();
+                        }
+                    }
+                    ui.separator();
+
+                    // ── Preprocess (disabled until a recording is saved) ──
+                    egui::ComboBox::from_id_salt("zuna_preset")
+                        .selected_text(self.zuna_preset.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.zuna_preset, ZunaPreset::None, ZunaPreset::None.label());
+                            ui.selectable_value(&mut self.zuna_preset, ZunaPreset::Ch8, ZunaPreset::Ch8.label());
+                            ui.selectable_value(&mut self.zuna_preset, ZunaPreset::Ch10, ZunaPreset::Ch10.label());
+                        });
+                    let preprocess_enabled = has_saved_recording && !self.job_busy && !recording_active;
+                    if ui.add_enabled(preprocess_enabled, egui::Button::new("Preprocess"))
+                        .on_hover_text(if has_saved_recording {
+                            "Run ZUNA pipeline on the saved recording"
+                        } else {
+                            "Record a session first, then Preprocess"
+                        })
+                        .clicked()
+                    {
+                        self.start_preprocess();
+                    }
+                    ui.separator();
+
+                    // ── Reset button with confirmation ──
+                    if self.reset_confirm_pending {
+                        ui.colored_label(egui::Color32::from_rgb(220, 160, 40), "Drop recording?");
+                        if ui.button("Yes").clicked() {
+                            self.reset_recording();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.reset_confirm_pending = false;
+                        }
+                    } else if has_saved_recording || recording_active {
+                        if ui.button("Reset")
+                            .on_hover_text("Discard the current recording and start fresh")
+                            .clicked()
+                        {
+                            self.reset_confirm_pending = true;
+                        }
+                    }
+                } else {
+                    // ── BLE / None mode: original toolbar ──
+                    ui.label("Duration (s):");
+                    ui.add(
+                        egui::DragValue::new(&mut self.record_secs)
+                            .range(1..=3600)
+                            .speed(1.0),
+                    );
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.job_busy, egui::Button::new("Record"))
+                        .on_hover_text("Record from Muse → FIF (needs muse-record-fif)")
+                        .clicked()
+                    {
+                        self.start_record_only_ble();
+                    }
+                    ui.separator();
+                    ui.label("ZUNA preset:");
+                    egui::ComboBox::from_id_salt("zuna_preset")
+                        .selected_text(self.zuna_preset.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.zuna_preset, ZunaPreset::None, ZunaPreset::None.label());
+                            ui.selectable_value(&mut self.zuna_preset, ZunaPreset::Ch8, ZunaPreset::Ch8.label());
+                            ui.selectable_value(&mut self.zuna_preset, ZunaPreset::Ch10, ZunaPreset::Ch10.label());
+                        });
+                    if ui
+                        .add_enabled(!self.job_busy, egui::Button::new("Preprocess"))
+                        .on_hover_text("Record then run ZUNA pipeline")
+                        .clicked()
+                    {
+                        self.start_preprocess();
+                    }
                 }
+
                 if self.job_busy {
                     ui.spinner();
                 }
@@ -882,14 +1135,18 @@ impl eframe::App for EegViewerApp {
                     }
                 }
                 ui.separator();
-                ui.label("Batch:");
-                if self.job_busy {
-                    ui.spinner();
-                    ui.label("recording / ZUNA…");
-                } else {
-                    ui.label(RichText::new(&self.muse_status).weak()).on_hover_text(
-                        "Record / Preprocess: Bluetooth Muse → FIF → ZUNA. Live plot follows Plot source.",
+                if recording_active {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 50, 50),
+                        format!("● REC  {} samples ({:.1} s)",
+                            record_sample_count,
+                            record_sample_count as f64 / 256.0),
                     );
+                } else if self.job_busy {
+                    ui.spinner();
+                    ui.label("saving / ZUNA…");
+                } else {
+                    ui.label(RichText::new(&self.muse_status).weak());
                 }
                 if self.resume_muse_pending {
                     if ui
@@ -1225,6 +1482,19 @@ fn merge_stack(
 pub(crate) fn merge_single(state: &mut SharedState, by_channel: Vec<Vec<f32>>, max_points: usize) {
     state.channels_recon.clear();
     state.channel_names = None;
+
+    // Accumulate into recording buffer when active (before merge_stack moves data).
+    if state.recording_active {
+        if state.record_buffer.is_empty() || state.record_buffer.len() != by_channel.len() {
+            state.record_buffer = by_channel.clone();
+        } else {
+            for (acc, incoming) in state.record_buffer.iter_mut().zip(by_channel.iter()) {
+                acc.extend_from_slice(incoming);
+            }
+        }
+        state.record_sample_count = state.record_buffer.iter().map(|v| v.len()).min().unwrap_or(0);
+    }
+
     merge_stack(&mut state.channels_orig, by_channel, max_points);
     state.frames_received = state.frames_received.saturating_add(1);
 }
@@ -1372,6 +1642,10 @@ fn main() -> eframe::Result<()> {
                 pipeline_step: None,
                 pipeline_label: String::new(),
                 resume_muse_pending: false,
+                last_recording_fif: None,
+                record_started_at: None,
+                last_record_toggle: None,
+                reset_confirm_pending: false,
             }) as Box<dyn eframe::App>)
         }),
     )
