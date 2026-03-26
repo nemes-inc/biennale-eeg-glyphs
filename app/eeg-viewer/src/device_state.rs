@@ -214,7 +214,7 @@ pub fn session_file_path(base_dir: &Path, device_name: &str) -> PathBuf {
 /// to the inference server, enabling replay of unsent frames on reconnect.
 ///
 /// Session file format: concatenated raw EEGM binary frames (self-describing
-/// via 20-byte headers: magic + headband_id + epoch_seq + n_channels + n_samples).
+/// via 28-byte headers: magic + headband_id + epoch_seq + n_channels + n_samples + timestamp_us).
 pub struct SessionWriter {
     file: File,
     /// Number of frames appended.
@@ -271,6 +271,10 @@ pub fn read_session_frames(path: &Path, from_frame: u64) -> io::Result<Vec<EegmF
 
         let n_channels = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]);
         let n_samples = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
+        let timestamp_us = u64::from_le_bytes([
+            hdr_rest[16], hdr_rest[17], hdr_rest[18], hdr_rest[19],
+            hdr_rest[20], hdr_rest[21], hdr_rest[22], hdr_rest[23],
+        ]);
         let payload_len = (n_channels as usize) * (n_samples as usize) * 4;
 
         if skipped < from_frame {
@@ -296,6 +300,7 @@ pub fn read_session_frames(path: &Path, from_frame: u64) -> io::Result<Vec<EegmF
             epoch_seq,
             n_channels,
             n_samples,
+            timestamp_us,
             data,
         });
         skipped += 1;

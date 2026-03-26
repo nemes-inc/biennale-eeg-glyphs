@@ -12,9 +12,10 @@
 //! | 8      | `u32` | `epoch_seq` — monotonic sequence per headband       |
 //! | 12     | `u32` | `n_channels`                                       |
 //! | 16     | `u32` | `n_samples` per channel                            |
-//! | 20     | `f32[n_channels × n_samples]` | Channel-major payload |
+//! | 20     | `u64` | `timestamp_us` — microsecond timestamp (monotonic or epoch) |
+//! | 28     | `f32[n_channels × n_samples]` | Channel-major payload |
 //!
-//! Total frame size: `20 + 4 × n_channels × n_samples` bytes.
+//! Total frame size: `28 + 4 × n_channels × n_samples` bytes.
 //!
 //! Direction determines semantics:
 //! - **Hub → Server**: raw EEG from headband N
@@ -49,7 +50,7 @@ pub const MAGIC_EEGM: u32 = 0x4545_474D;
 pub const MAGIC_EEGC: u32 = 0x4545_4743;
 
 /// Header size in bytes for data frames.
-pub const HEADER_SIZE: usize = 20;
+pub const HEADER_SIZE: usize = 28;
 
 /// Fixed size of a control message (EEGC): 6 × u32 = 24 bytes.
 pub const CTRL_SIZE: usize = 24;
@@ -64,6 +65,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 const MSG_CONNECT_REQ: u32 = 1;
 const MSG_CONNECT_ACK: u32 = 2;
+const MSG_TARGET_CHANNELS_REQ: u32 = 3;
+const MSG_TARGET_CHANNELS_ACK: u32 = 4;
 
 /// Connection request sent by the hub to the inference server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,69 @@ impl ConnectAck {
     }
 }
 
+/// Request to set ZUNA target channels for upsampling.
+///
+/// Wire format: standard 24-byte EEGC header (msg_type=3) followed by
+/// `payload_len` bytes of UTF-8 comma-separated channel names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetChannelsReq {
+    pub protocol_version: u32,
+    pub channel_names: Vec<String>,
+}
+
+impl TargetChannelsReq {
+    pub fn new(channel_names: Vec<String>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            channel_names,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let payload = self.channel_names.join(",");
+        let payload_bytes = payload.as_bytes();
+        let mut buf = Vec::with_capacity(CTRL_SIZE + payload_bytes.len());
+        buf.extend_from_slice(&MAGIC_EEGC.to_le_bytes());
+        buf.extend_from_slice(&MSG_TARGET_CHANNELS_REQ.to_le_bytes());
+        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
+        buf.extend_from_slice(&(self.channel_names.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        buf.extend_from_slice(payload_bytes);
+        buf
+    }
+
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.encode())
+    }
+}
+
+/// Server acknowledgement for a TargetChannelsReq.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetChannelsAck {
+    pub protocol_version: u32,
+    pub n_target_channels: u32,
+    /// 0 = OK, non-zero = error code.
+    pub status: u32,
+}
+
+impl TargetChannelsAck {
+    pub fn is_ok(&self) -> bool {
+        self.status == 0
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(CTRL_SIZE);
+        buf.extend_from_slice(&MAGIC_EEGC.to_le_bytes());
+        buf.extend_from_slice(&MSG_TARGET_CHANNELS_ACK.to_le_bytes());
+        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
+        buf.extend_from_slice(&self.n_target_channels.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        buf.extend_from_slice(&self.status.to_le_bytes());
+        buf
+    }
+}
+
 // ── Top-level message enum ───────────────────────────────────────────────────
 
 /// A message read from the wire — either a control handshake or a data frame.
@@ -154,6 +220,8 @@ impl ConnectAck {
 pub enum EegmMessage {
     ConnectReq(ConnectReq),
     ConnectAck(ConnectAck),
+    TargetChannelsReq(TargetChannelsReq),
+    TargetChannelsAck(TargetChannelsAck),
     Data(EegmFrame),
 }
 
@@ -193,6 +261,32 @@ impl EegmMessage {
                         sample_rate,
                         status,
                     }))),
+                    MSG_TARGET_CHANNELS_REQ => {
+                        let payload_len = u32::from_le_bytes(
+                            [rest[12], rest[13], rest[14], rest[15]],
+                        ) as usize;
+                        let mut payload = vec![0u8; payload_len];
+                        r.read_exact(&mut payload)?;
+                        let names_str = String::from_utf8_lossy(&payload);
+                        let channel_names: Vec<String> = names_str
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        Ok(Some(EegmMessage::TargetChannelsReq(TargetChannelsReq {
+                            protocol_version: version,
+                            channel_names,
+                        })))
+                    }
+                    MSG_TARGET_CHANNELS_ACK => {
+                        let n_target = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+                        let status = u32::from_le_bytes([rest[16], rest[17], rest[18], rest[19]]);
+                        Ok(Some(EegmMessage::TargetChannelsAck(TargetChannelsAck {
+                            protocol_version: version,
+                            n_target_channels: n_target,
+                            status,
+                        })))
+                    }
                     _ => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("unknown EEGC msg_type: {msg_type}"),
@@ -207,6 +301,10 @@ impl EegmMessage {
                 let epoch_seq = u32::from_le_bytes([hdr_rest[4], hdr_rest[5], hdr_rest[6], hdr_rest[7]]);
                 let n_channels = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]);
                 let n_samples = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
+                let timestamp_us = u64::from_le_bytes([
+                    hdr_rest[16], hdr_rest[17], hdr_rest[18], hdr_rest[19],
+                    hdr_rest[20], hdr_rest[21], hdr_rest[22], hdr_rest[23],
+                ]);
 
                 if n_channels > 64 || n_samples > 65536 {
                     return Err(io::Error::new(
@@ -228,6 +326,7 @@ impl EegmMessage {
                     epoch_seq,
                     n_channels,
                     n_samples,
+                    timestamp_us,
                     data,
                 })))
             }
@@ -250,6 +349,8 @@ pub struct EegmFrame {
     pub n_channels: u32,
     /// Number of samples per channel.
     pub n_samples: u32,
+    /// Microsecond timestamp (monotonic or epoch), 0 if unset.
+    pub timestamp_us: u64,
     /// Channel-major payload: all samples for ch0, then ch1, …
     /// Length = n_channels × n_samples.
     pub data: Vec<f32>,
@@ -275,6 +376,7 @@ impl EegmFrame {
             epoch_seq,
             n_channels,
             n_samples: n_samples as u32,
+            timestamp_us: 0,
             data,
         }
     }
@@ -292,6 +394,7 @@ impl EegmFrame {
         buf.extend_from_slice(&self.epoch_seq.to_le_bytes());
         buf.extend_from_slice(&self.n_channels.to_le_bytes());
         buf.extend_from_slice(&self.n_samples.to_le_bytes());
+        buf.extend_from_slice(&self.timestamp_us.to_le_bytes());
         for &sample in &self.data {
             buf.extend_from_slice(&sample.to_le_bytes());
         }
@@ -329,6 +432,9 @@ impl EegmFrame {
         let epoch_seq = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
         let n_channels = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
         let n_samples = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+        let timestamp_us = u64::from_le_bytes([
+            hdr[20], hdr[21], hdr[22], hdr[23], hdr[24], hdr[25], hdr[26], hdr[27],
+        ]);
 
         // Sanity limits
         if n_channels > 64 || n_samples > 65536 {
@@ -352,6 +458,7 @@ impl EegmFrame {
             epoch_seq,
             n_channels,
             n_samples,
+            timestamp_us,
             data,
         }))
     }

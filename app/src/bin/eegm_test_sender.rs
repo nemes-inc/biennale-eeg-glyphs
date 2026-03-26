@@ -236,7 +236,14 @@ fn main() -> Result<()> {
                         if magic == MAGIC_EEGC {
                             let mut skip = [0u8; CTRL_SIZE - 4];
                             if reader.read_exact(&mut skip).is_err() { break; }
-                            log::debug!("← Skipping EEGC control message");
+                            // If TargetChannelsReq (msg_type=3), drain variable payload
+                            let msg_type = u32::from_le_bytes([skip[0], skip[1], skip[2], skip[3]]);
+                            if msg_type == 3 {
+                                let plen = u32::from_le_bytes([skip[12], skip[13], skip[14], skip[15]]) as usize;
+                                let mut payload = vec![0u8; plen];
+                                if reader.read_exact(&mut payload).is_err() { break; }
+                            }
+                            log::debug!("← Skipping EEGC control message (type={msg_type})");
                             continue;
                         }
                         if magic != MAGIC_EEGM {

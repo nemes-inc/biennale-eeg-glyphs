@@ -31,6 +31,8 @@ PROTOCOL_VERSION = 1
 
 MSG_CONNECT_REQ = 1
 MSG_CONNECT_ACK = 2
+MSG_TARGET_CHANNELS_REQ = 3
+MSG_TARGET_CHANNELS_ACK = 4
 
 
 @dataclass
@@ -86,6 +88,68 @@ class ConnectAck:
             self.protocol_version,
             self.n_headbands,
             self.sample_rate,
+            self.status,
+        )
+
+
+@dataclass
+class TargetChannelsReq:
+    """Request from client to set ZUNA target channels for upsampling.
+
+    Sent after ConnectAck, before (or during) streaming.  The server
+    acknowledges with a TargetChannelsAck.
+
+    Wire format: standard 24-byte EEGC header followed by *payload_len*
+    bytes of UTF-8 comma-separated channel names (e.g. ``Fz,Cz,Pz``).
+    """
+
+    protocol_version: int = PROTOCOL_VERSION
+    channel_names: list[str] = field(default_factory=list)
+
+    def encode(self) -> bytes:
+        payload = ",".join(self.channel_names).encode("utf-8")
+        header = struct.pack(
+            CTRL_FMT,
+            MAGIC_EEGC,
+            MSG_TARGET_CHANNELS_REQ,
+            self.protocol_version,
+            len(self.channel_names),
+            len(payload),
+            0,  # reserved
+        )
+        return header + payload
+
+
+@dataclass
+class TargetChannelsAck:
+    """Server acknowledgement for a TargetChannelsReq."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    n_target_channels: int = 0
+    status: int = 0  # 0 = OK
+
+    @staticmethod
+    def ok(n_target_channels: int) -> "TargetChannelsAck":
+        return TargetChannelsAck(
+            n_target_channels=n_target_channels,
+            status=0,
+        )
+
+    @staticmethod
+    def error(code: int) -> "TargetChannelsAck":
+        return TargetChannelsAck(status=code)
+
+    def is_ok(self) -> bool:
+        return self.status == 0
+
+    def encode(self) -> bytes:
+        return struct.pack(
+            CTRL_FMT,
+            MAGIC_EEGC,
+            MSG_TARGET_CHANNELS_ACK,
+            self.protocol_version,
+            self.n_target_channels,
+            0,  # reserved
             self.status,
         )
 
@@ -177,6 +241,25 @@ async def read_message(reader) -> ConnectReq | ConnectAck | EegmFrame | None:
                 sample_rate=sample_rate,
                 status=status,
             )
+        elif msg_type == MSG_TARGET_CHANNELS_REQ:
+            # field layout: version, n_target_channels, payload_len, reserved
+            payload_len = sample_rate  # 3rd data field = payload_len
+            payload = await reader.readexactly(payload_len)
+            names = [
+                s.strip()
+                for s in payload.decode("utf-8").split(",")
+                if s.strip()
+            ]
+            return TargetChannelsReq(
+                protocol_version=version,
+                channel_names=names,
+            )
+        elif msg_type == MSG_TARGET_CHANNELS_ACK:
+            return TargetChannelsAck(
+                protocol_version=version,
+                n_target_channels=n_headbands,
+                status=status,
+            )
         else:
             raise IOError(f"unknown EEGC msg_type: {msg_type}")
 
@@ -215,7 +298,10 @@ async def read_frame(reader) -> EegmFrame | None:
     raise IOError(f"expected EegmFrame, got {type(msg).__name__}")
 
 
-async def write_message(writer, msg: ConnectReq | ConnectAck | EegmFrame) -> None:
+async def write_message(
+    writer,
+    msg: ConnectReq | ConnectAck | TargetChannelsReq | TargetChannelsAck | EegmFrame,
+) -> None:
     """Write any EEGM/EEGC message to an asyncio StreamWriter."""
     writer.write(msg.encode())
     await writer.drain()

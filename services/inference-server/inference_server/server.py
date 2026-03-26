@@ -32,6 +32,8 @@ from .eegm_protocol import (
     ConnectAck,
     ConnectReq,
     EegmFrame,
+    TargetChannelsAck,
+    TargetChannelsReq,
     read_message,
     write_frame,
     write_message,
@@ -107,6 +109,10 @@ class InferenceServer:
         self._tcp_server = None
         self._send_task: asyncio.Task | None = None
 
+        # Per-session target channels (set by client via TargetChannelsReq,
+        # overrides the CLI --target-channels default for this connection).
+        self._session_target_channels: list[str] | None = None
+
     async def start(self) -> None:
         """Start the TCP server and worker pool."""
         self._loop = asyncio.get_running_loop()
@@ -154,10 +160,11 @@ class InferenceServer:
 
             self._writer = writer
 
-            # Reset buffers for new session
+            # Reset buffers and session state for new connection
             for buf in self.buffers:
                 buf.clear()
             self.frames_received = 0
+            self._session_target_channels = None
 
             # ── Streaming phase ────────────────────────────────────────
             while self._running:
@@ -168,6 +175,17 @@ class InferenceServer:
 
                 if isinstance(msg, ConnectReq):
                     log.warning("Duplicate ConnectReq from %s — ignoring", addr)
+                    continue
+
+                if isinstance(msg, TargetChannelsReq):
+                    self._session_target_channels = msg.channel_names
+                    log.info(
+                        "Client %s set target channels: %s",
+                        addr,
+                        msg.channel_names,
+                    )
+                    ack = TargetChannelsAck.ok(len(msg.channel_names))
+                    await write_message(writer, ack)
                     continue
 
                 if not isinstance(msg, EegmFrame):
@@ -198,7 +216,12 @@ class InferenceServer:
                     epoch = self.buffers[hid].pop_epoch()
                     if epoch is None:
                         break
-                    job = InferenceJob(headband_id=hid, epoch=epoch)
+                    tc = self._session_target_channels or self.target_channels
+                    job = InferenceJob(
+                        headband_id=hid,
+                        epoch=epoch,
+                        target_channels=tc,
+                    )
                     try:
                         self._job_queue.put_nowait(job)
                         self.epochs_queued += 1

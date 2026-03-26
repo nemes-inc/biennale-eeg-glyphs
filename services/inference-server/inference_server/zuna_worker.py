@@ -75,6 +75,7 @@ class InferenceJob:
 
     headband_id: int
     epoch: Epoch
+    target_channels: list[str] | None = None
 
 
 class ZunaWorker:
@@ -173,6 +174,8 @@ class ZunaWorker:
         raw.save(str(fif_path), overwrite=True, verbose=False)
 
         # ── 2. Preprocess ─────────────────────────────────────────────────
+        # Per-job target channels override the worker default.
+        job_target_channels = job.target_channels or self.target_channels
         preprocessing(
             input_dir=str(input_dir),
             output_dir=str(pt_in),
@@ -183,7 +186,7 @@ class ZunaWorker:
             drop_bad_channels=False,
             drop_bad_epochs=False,
             zero_out_artifacts=False,
-            target_channel_count=self.target_channels,
+            target_channel_count=job_target_channels,
             bad_channels=None,
         )
 
