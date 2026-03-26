@@ -1,2 +1,5 @@
 .venv/
 zuna_repo/
+live_captures/
+sessions/
+zuna_pipeline_run/
