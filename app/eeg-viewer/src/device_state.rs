@@ -63,6 +63,9 @@ impl HeadbandId {
 
 // ── DeviceState ──────────────────────────────────────────────────────────────
 
+/// Muse EEG sample rate in Hz.
+const SAMPLE_RATE: f64 = 256.0;
+
 /// Per-device EEG streaming state.
 /// Accessed by: BLE task (writer), UI thread (reader), recording save thread (drainer).
 #[allow(dead_code)]
@@ -70,10 +73,11 @@ pub struct DeviceState {
     pub device_name: String,
     pub device_id: String,
 
-    /// Rolling plot buffers: [channel][samples], trimmed to max_points.
-    pub raw_channels: Vec<Vec<f32>>,
-    /// Reconstructed channels from inference server.
-    pub recon_channels: Vec<Vec<f32>>,
+    /// Rolling plot buffers: [channel][[time_secs, value]], trimmed to max_points.
+    /// Time is relative to stream start (first raw frame).
+    pub raw_channels: Vec<Vec<[f64; 2]>>,
+    /// Reconstructed channels from inference server, same time axis.
+    pub recon_channels: Vec<Vec<[f64; 2]>>,
     pub raw_frame_count: u64,
     pub recon_frame_count: u64,
 
@@ -83,7 +87,7 @@ pub struct DeviceState {
 
     /// True while accumulating samples into record_buffer.
     pub recording_active: bool,
-    /// Unbounded accumulation buffer: [channel][all_samples].
+    /// Unbounded accumulation buffer: [channel][all_samples] (plain f32 for CSV export).
     pub record_buffer: Vec<Vec<f32>>,
     pub record_sample_count: usize,
 
@@ -91,6 +95,10 @@ pub struct DeviceState {
     pub session_frames_written: u64,
     /// Frames sent to inference server.
     pub session_frames_sent: u64,
+
+    /// Timestamp of the first raw frame (microseconds since epoch).
+    /// Used to compute relative time for plot x-axis.
+    stream_start_us: Option<u64>,
 
     max_points: usize,
 }
@@ -111,17 +119,24 @@ impl DeviceState {
             record_sample_count: 0,
             session_frames_written: 0,
             session_frames_sent: 0,
+            stream_start_us: None,
             max_points,
         }
     }
 
-    /// Push a raw EEG frame (one CHUNK of aligned channel data).
-    pub fn push_raw_frame(&mut self, channels: Vec<Vec<f32>>) {
+    /// Push a raw EEG frame (one CHUNK of aligned channel data) with its capture timestamp.
+    pub fn push_raw_frame(&mut self, channels: Vec<Vec<f32>>, timestamp_us: u64) {
+        if self.stream_start_us.is_none() && timestamp_us > 0 {
+            self.stream_start_us = Some(timestamp_us);
+        }
+        let base_secs = self.relative_secs(timestamp_us);
+
         for (ch_idx, samples) in channels.iter().enumerate() {
             if ch_idx >= self.raw_channels.len() {
                 break;
             }
-            push_rolling(&mut self.raw_channels[ch_idx], samples, self.max_points);
+            let timed = samples_to_timed(samples, base_secs);
+            push_rolling_timed(&mut self.raw_channels[ch_idx], &timed, self.max_points);
 
             if self.recording_active {
                 if self.record_buffer.len() <= ch_idx {
@@ -142,15 +157,35 @@ impl DeviceState {
         self.raw_frame_count += 1;
     }
 
-    /// Push reconstructed EEG from inference server.
-    pub fn push_reconstructed_frame(&mut self, channels: Vec<Vec<f32>>) {
+    /// Push reconstructed EEG from inference server with the original capture timestamp.
+    /// If `timestamp_us` is 0 (server didn't preserve it), falls back to current raw position.
+    pub fn push_reconstructed_frame(&mut self, channels: Vec<Vec<f32>>, timestamp_us: u64) {
+        let base_secs = if timestamp_us > 0 {
+            self.relative_secs(timestamp_us)
+        } else {
+            // Fallback: place at current end of raw timeline
+            self.raw_channels.first()
+                .and_then(|ch| ch.last())
+                .map(|pt| pt[0])
+                .unwrap_or(0.0)
+        };
+
         while self.recon_channels.len() < channels.len() {
             self.recon_channels.push(Vec::new());
         }
         for (ch_idx, samples) in channels.iter().enumerate() {
-            push_rolling(&mut self.recon_channels[ch_idx], samples, self.max_points);
+            let timed = samples_to_timed(samples, base_secs);
+            push_rolling_timed(&mut self.recon_channels[ch_idx], &timed, self.max_points);
         }
         self.recon_frame_count += 1;
+    }
+
+    /// Convert an absolute timestamp to seconds relative to stream start.
+    fn relative_secs(&self, timestamp_us: u64) -> f64 {
+        match self.stream_start_us {
+            Some(start) => timestamp_us.saturating_sub(start) as f64 / 1_000_000.0,
+            None => 0.0,
+        }
     }
 
     /// Start recording: clear buffer, set flag.
@@ -214,7 +249,7 @@ pub fn session_file_path(base_dir: &Path, device_name: &str) -> PathBuf {
 /// to the inference server, enabling replay of unsent frames on reconnect.
 ///
 /// Session file format: concatenated raw EEGM binary frames (self-describing
-/// via 20-byte headers: magic + headband_id + epoch_seq + n_channels + n_samples).
+/// via 28-byte headers: magic + headband_id + epoch_seq + n_channels + n_samples + timestamp_us).
 pub struct SessionWriter {
     file: File,
     /// Number of frames appended.
@@ -254,7 +289,7 @@ impl SessionWriter {
 pub fn read_session_frames(path: &Path, from_frame: u64) -> io::Result<Vec<EegmFrame>> {
     let mut file = OpenOptions::new().read(true).open(path)?;
     let mut frames = Vec::new();
-    let mut skipped: u64 = 0;
+    let mut frame_index: u64 = 0;
 
     loop {
         // Read 4-byte magic
@@ -273,10 +308,10 @@ pub fn read_session_frames(path: &Path, from_frame: u64) -> io::Result<Vec<EegmF
         let n_samples = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
         let payload_len = (n_channels as usize) * (n_samples as usize) * 4;
 
-        if skipped < from_frame {
+        if frame_index < from_frame {
             // Skip the payload
             file.seek(SeekFrom::Current(payload_len as i64))?;
-            skipped += 1;
+            frame_index += 1;
             continue;
         }
 
@@ -286,6 +321,10 @@ pub fn read_session_frames(path: &Path, from_frame: u64) -> io::Result<Vec<EegmF
 
         let headband_id = u32::from_le_bytes([hdr_rest[0], hdr_rest[1], hdr_rest[2], hdr_rest[3]]);
         let epoch_seq = u32::from_le_bytes([hdr_rest[4], hdr_rest[5], hdr_rest[6], hdr_rest[7]]);
+        let timestamp_us = u64::from_le_bytes([
+            hdr_rest[16], hdr_rest[17], hdr_rest[18], hdr_rest[19],
+            hdr_rest[20], hdr_rest[21], hdr_rest[22], hdr_rest[23],
+        ]);
         let data: Vec<f32> = raw
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -296,9 +335,10 @@ pub fn read_session_frames(path: &Path, from_frame: u64) -> io::Result<Vec<EegmF
             epoch_seq,
             n_channels,
             n_samples,
+            timestamp_us,
             data,
         });
-        skipped += 1;
+        frame_index += 1;
     }
 
     Ok(frames)
@@ -364,6 +404,25 @@ pub fn push_rolling(buffer: &mut Vec<f32>, samples: &[f32], max_points: usize) {
     }
 }
 
+/// Convert raw f32 samples to timed [time_secs, value] points.
+/// Samples are spaced at 1/SAMPLE_RATE from `base_secs`.
+fn samples_to_timed(samples: &[f32], base_secs: f64) -> Vec<[f64; 2]> {
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| [base_secs + i as f64 / SAMPLE_RATE, v as f64])
+        .collect()
+}
+
+/// Append timed points to rolling buffer, trim to max_points.
+fn push_rolling_timed(buffer: &mut Vec<[f64; 2]>, points: &[[f64; 2]], max_points: usize) {
+    buffer.extend_from_slice(points);
+    let excess = buffer.len().saturating_sub(max_points);
+    if excess > 0 {
+        buffer.drain(..excess);
+    }
+}
+
 /// Append samples to recording accumulation buffer (no trimming).
 pub fn push_accumulating(buffer: &mut Vec<f32>, samples: &[f32]) {
     buffer.extend_from_slice(samples);
@@ -374,9 +433,10 @@ pub fn build_eegm_frame(
     headband_id: HeadbandId,
     epoch_seq: u32,
     channels: &[Vec<f32>],
+    timestamp_us: u64,
 ) -> EegmFrame {
     let n_samples = channels.first().map_or(0, |c| c.len());
-    EegmFrame::new(headband_id.as_u32(), epoch_seq, channels, n_samples)
+    EegmFrame::with_timestamp(headband_id.as_u32(), epoch_seq, channels, n_samples, timestamp_us)
 }
 
 /// Build display label for a discovered device.
@@ -558,11 +618,12 @@ mod tests {
     fn build_eegm_frame_basic() {
         let channels = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
         let hid = HeadbandId::new(1).unwrap();
-        let frame = build_eegm_frame(hid, 42, &channels);
+        let frame = build_eegm_frame(hid, 42, &channels, 1_000_000);
         assert_eq!(frame.headband_id, 1);
         assert_eq!(frame.epoch_seq, 42);
         assert_eq!(frame.n_channels, 2);
         assert_eq!(frame.n_samples, 2);
+        assert_eq!(frame.timestamp_us, 1_000_000);
     }
 
     // ── extract_channels_from_frame ─────────────────────────────────────
@@ -581,8 +642,8 @@ mod tests {
     fn device_state_push_raw_trims() {
         let mut ds = DeviceState::new("Test".into(), "id".into(), 10);
         let frame = vec![vec![1.0; 8]; 4];
-        ds.push_raw_frame(frame.clone());
-        ds.push_raw_frame(frame);
+        ds.push_raw_frame(frame.clone(), 1_000_000);
+        ds.push_raw_frame(frame, 2_000_000);
         // 16 samples pushed, max_points=10, should be trimmed to 10
         assert_eq!(ds.raw_channels[0].len(), 10);
         assert_eq!(ds.raw_frame_count, 2);
@@ -593,8 +654,8 @@ mod tests {
         let mut ds = DeviceState::new("Test".into(), "id".into(), 10);
         ds.start_recording();
         let frame = vec![vec![1.0; 5]; 4];
-        ds.push_raw_frame(frame.clone());
-        ds.push_raw_frame(frame);
+        ds.push_raw_frame(frame.clone(), 1_000_000);
+        ds.push_raw_frame(frame, 2_000_000);
         // Recording buffer should have all 10 samples (unbounded)
         assert_eq!(ds.record_sample_count, 10);
         // Raw channels should also have 10 (at max_points)
@@ -605,7 +666,7 @@ mod tests {
     fn device_state_take_recording_clears() {
         let mut ds = DeviceState::new("Test".into(), "id".into(), 100);
         ds.start_recording();
-        ds.push_raw_frame(vec![vec![1.0; 5]; 4]);
+        ds.push_raw_frame(vec![vec![1.0; 5]; 4], 1_000_000);
         let (buf, count) = ds.take_recording();
         assert_eq!(count, 5);
         assert_eq!(buf.len(), 4);
@@ -618,7 +679,7 @@ mod tests {
     fn device_state_cancel_recording() {
         let mut ds = DeviceState::new("Test".into(), "id".into(), 100);
         ds.start_recording();
-        ds.push_raw_frame(vec![vec![1.0; 5]; 4]);
+        ds.push_raw_frame(vec![vec![1.0; 5]; 4], 1_000_000);
         ds.cancel_recording();
         assert!(!ds.recording_active);
         assert_eq!(ds.record_sample_count, 0);
@@ -627,11 +688,75 @@ mod tests {
     #[test]
     fn device_state_push_reconstructed() {
         let mut ds = DeviceState::new("Test".into(), "id".into(), 10);
+        // Need raw data first for stream_start_us
+        ds.push_raw_frame(vec![vec![0.0; 5]; 4], 1_000_000);
         let frame = vec![vec![1.0; 5]; 4];
-        ds.push_reconstructed_frame(frame);
+        ds.push_reconstructed_frame(frame, 1_000_000);
         assert_eq!(ds.recon_channels.len(), 4);
         assert_eq!(ds.recon_channels[0].len(), 5);
         assert_eq!(ds.recon_frame_count, 1);
+    }
+
+    // ── Timestamp alignment tests ───────────────────────────────────────
+
+    #[test]
+    fn raw_frame_stores_timed_points() {
+        let mut ds = DeviceState::new("T".into(), "id".into(), 1000);
+        // First frame at t=1_000_000 µs (1 second after epoch)
+        ds.push_raw_frame(vec![vec![10.0, 20.0]; 4], 1_000_000);
+        // stream_start_us should be set to first frame
+        let pts = &ds.raw_channels[0];
+        assert_eq!(pts.len(), 2);
+        // First sample at relative time 0.0s
+        assert!((pts[0][0] - 0.0).abs() < 1e-9);
+        assert!((pts[0][1] - 10.0).abs() < 1e-9);
+        // Second sample at 1/256 s later
+        assert!((pts[1][0] - 1.0 / 256.0).abs() < 1e-6);
+        assert!((pts[1][1] - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn second_chunk_time_continues() {
+        let mut ds = DeviceState::new("T".into(), "id".into(), 1000);
+        // 256 samples at t=0 → occupies 0.0 to ~1.0 seconds
+        ds.push_raw_frame(vec![vec![1.0; 256]; 4], 1_000_000);
+        // Next 256 samples 1 second later
+        ds.push_raw_frame(vec![vec![2.0; 256]; 4], 2_000_000);
+        let pts = &ds.raw_channels[0];
+        assert_eq!(pts.len(), 512);
+        // First chunk starts at 0.0
+        assert!((pts[0][0] - 0.0).abs() < 1e-9);
+        // Second chunk starts at 1.0s (1_000_000 µs relative)
+        assert!((pts[256][0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recon_aligns_with_raw_by_timestamp() {
+        let mut ds = DeviceState::new("T".into(), "id".into(), 10000);
+        // Raw at t=1_000_000 µs
+        ds.push_raw_frame(vec![vec![1.0; 256]; 4], 1_000_000);
+        // Recon arrives later but carries the SAME timestamp
+        ds.push_reconstructed_frame(vec![vec![9.0; 256]; 4], 1_000_000);
+
+        let raw_t0 = ds.raw_channels[0][0][0];
+        let recon_t0 = ds.recon_channels[0][0][0];
+        // Both should start at the same x-coordinate
+        assert!((raw_t0 - recon_t0).abs() < 1e-9,
+            "raw_t0={raw_t0}, recon_t0={recon_t0}");
+    }
+
+    #[test]
+    fn recon_ts_zero_falls_back_to_end_of_raw() {
+        let mut ds = DeviceState::new("T".into(), "id".into(), 10000);
+        // Push 256 samples of raw data
+        ds.push_raw_frame(vec![vec![1.0; 256]; 4], 1_000_000);
+        let raw_last_t = ds.raw_channels[0].last().unwrap()[0];
+
+        // Recon with ts=0 should fall back to end of raw
+        ds.push_reconstructed_frame(vec![vec![9.0; 10]; 4], 0);
+        let recon_t0 = ds.recon_channels[0][0][0];
+        assert!((recon_t0 - raw_last_t).abs() < 1e-9,
+            "recon should start at end of raw: recon_t0={recon_t0}, raw_last_t={raw_last_t}");
     }
 
     // ── next_available_headband_id (needs ConnectedDevice stubs) ────────

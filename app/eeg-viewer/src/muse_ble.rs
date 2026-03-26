@@ -179,7 +179,11 @@ async fn run_device_ble_loop(
                             if stop.load(Ordering::SeqCst) { break; }
 
                             let frame = drain_chunk(&mut channel_accum, CHUNK);
-                            let eegm = build_eegm_frame(headband_id, epoch_seq, &frame);
+                            let timestamp_us = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_micros() as u64)
+                                .unwrap_or(0);
+                            let eegm = build_eegm_frame(headband_id, epoch_seq, &frame, timestamp_us);
 
                             // Write-ahead: persist to session file FIRST
                             if let Some(ref mut sw) = session_writer {
@@ -198,7 +202,7 @@ async fn run_device_ble_loop(
                             // Update shared state (for UI + counters)
                             {
                                 let mut st = state.lock().unwrap();
-                                st.push_raw_frame(frame);
+                                st.push_raw_frame(frame, timestamp_us);
                                 if let Some(ref sw) = session_writer {
                                     st.session_frames_written = sw.frames_written();
                                 }

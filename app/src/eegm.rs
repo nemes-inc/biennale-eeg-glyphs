@@ -12,9 +12,10 @@
 //! | 8      | `u32` | `epoch_seq` — monotonic sequence per headband       |
 //! | 12     | `u32` | `n_channels`                                       |
 //! | 16     | `u32` | `n_samples` per channel                            |
-//! | 20     | `f32[n_channels × n_samples]` | Channel-major payload |
+//! | 20     | `u64` | `timestamp_us` — microseconds (monotonic/epoch)    |
+//! | 28     | `f32[n_channels × n_samples]` | Channel-major payload |
 //!
-//! Total frame size: `20 + 4 × n_channels × n_samples` bytes.
+//! Total frame size: `28 + 4 × n_channels × n_samples` bytes.
 //!
 //! Direction determines semantics:
 //! - **Hub → Server**: raw EEG from headband N
@@ -48,8 +49,8 @@ pub const MAGIC_EEGM: u32 = 0x4545_474D;
 /// EEGC control magic: ASCII "EEGC" = 0x4545_4743 (little-endian).
 pub const MAGIC_EEGC: u32 = 0x4545_4743;
 
-/// Header size in bytes for data frames.
-pub const HEADER_SIZE: usize = 20;
+/// Header size in bytes for data frames (5 × u32 + 1 × u64 = 28).
+pub const HEADER_SIZE: usize = 28;
 
 /// Fixed size of a control message (EEGC): 6 × u32 = 24 bytes.
 pub const CTRL_SIZE: usize = 24;
@@ -207,6 +208,10 @@ impl EegmMessage {
                 let epoch_seq = u32::from_le_bytes([hdr_rest[4], hdr_rest[5], hdr_rest[6], hdr_rest[7]]);
                 let n_channels = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]);
                 let n_samples = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
+                let timestamp_us = u64::from_le_bytes([
+                    hdr_rest[16], hdr_rest[17], hdr_rest[18], hdr_rest[19],
+                    hdr_rest[20], hdr_rest[21], hdr_rest[22], hdr_rest[23],
+                ]);
 
                 if n_channels > 64 || n_samples > 65536 {
                     return Err(io::Error::new(
@@ -228,6 +233,7 @@ impl EegmMessage {
                     epoch_seq,
                     n_channels,
                     n_samples,
+                    timestamp_us,
                     data,
                 })))
             }
@@ -250,20 +256,32 @@ pub struct EegmFrame {
     pub n_channels: u32,
     /// Number of samples per channel.
     pub n_samples: u32,
+    /// Monotonic timestamp in microseconds (e.g. since Unix epoch).
+    /// 0 means "not set" for backwards compatibility.
+    pub timestamp_us: u64,
     /// Channel-major payload: all samples for ch0, then ch1, …
     /// Length = n_channels × n_samples.
     pub data: Vec<f32>,
 }
 
 impl EegmFrame {
-    /// Create a new frame from channel vectors.
-    ///
-    /// `channels` must all have the same length ≥ `n_samples`.
+    /// Create a new frame from channel vectors (timestamp defaults to 0).
     pub fn new(
         headband_id: u32,
         epoch_seq: u32,
         channels: &[Vec<f32>],
         n_samples: usize,
+    ) -> Self {
+        Self::with_timestamp(headband_id, epoch_seq, channels, n_samples, 0)
+    }
+
+    /// Create a new frame with an explicit microsecond timestamp.
+    pub fn with_timestamp(
+        headband_id: u32,
+        epoch_seq: u32,
+        channels: &[Vec<f32>],
+        n_samples: usize,
+        timestamp_us: u64,
     ) -> Self {
         let n_channels = channels.len() as u32;
         let mut data = Vec::with_capacity(channels.len() * n_samples);
@@ -275,6 +293,7 @@ impl EegmFrame {
             epoch_seq,
             n_channels,
             n_samples: n_samples as u32,
+            timestamp_us,
             data,
         }
     }
@@ -292,6 +311,7 @@ impl EegmFrame {
         buf.extend_from_slice(&self.epoch_seq.to_le_bytes());
         buf.extend_from_slice(&self.n_channels.to_le_bytes());
         buf.extend_from_slice(&self.n_samples.to_le_bytes());
+        buf.extend_from_slice(&self.timestamp_us.to_le_bytes());
         for &sample in &self.data {
             buf.extend_from_slice(&sample.to_le_bytes());
         }
@@ -329,6 +349,9 @@ impl EegmFrame {
         let epoch_seq = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
         let n_channels = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
         let n_samples = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+        let timestamp_us = u64::from_le_bytes([
+            hdr[20], hdr[21], hdr[22], hdr[23], hdr[24], hdr[25], hdr[26], hdr[27],
+        ]);
 
         // Sanity limits
         if n_channels > 64 || n_samples > 65536 {
@@ -352,6 +375,7 @@ impl EegmFrame {
             epoch_seq,
             n_channels,
             n_samples,
+            timestamp_us,
             data,
         }))
     }
@@ -489,6 +513,67 @@ mod tests {
         bad[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         let mut cursor = Cursor::new(&bad);
         assert!(EegmFrame::read_from(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn timestamp_roundtrip() {
+        let channels = vec![vec![1.0f32, 2.0], vec![3.0, 4.0]];
+        let ts: u64 = 1_711_000_000_000; // microseconds since epoch
+        let frame = EegmFrame::with_timestamp(0, 5, &channels, 2, ts);
+        assert_eq!(frame.timestamp_us, ts);
+
+        let encoded = frame.encode();
+        // Header is now 28 bytes: 20 original + 8 for timestamp
+        assert_eq!(encoded.len(), HEADER_SIZE + 2 * 2 * 4);
+
+        let mut cursor = Cursor::new(&encoded);
+        let decoded = EegmFrame::read_from(&mut cursor).unwrap().unwrap();
+        assert_eq!(decoded.timestamp_us, ts);
+        assert_eq!(decoded.headband_id, 0);
+        assert_eq!(decoded.epoch_seq, 5);
+        assert_eq!(decoded.data, frame.data);
+    }
+
+    #[test]
+    fn new_defaults_timestamp_to_zero() {
+        let channels = vec![vec![1.0f32]; 1];
+        let frame = EegmFrame::new(0, 0, &channels, 1);
+        assert_eq!(frame.timestamp_us, 0);
+    }
+
+    #[test]
+    fn timestamp_preserved_in_multi_frame_stream() {
+        let mut buf = Vec::new();
+        for i in 0..3u32 {
+            let ch = vec![vec![i as f32; 4]; 2];
+            let ts = (i as u64 + 1) * 1_000_000;
+            let frame = EegmFrame::with_timestamp(i % 4, i, &ch, 4, ts);
+            frame.write_to(&mut buf).unwrap();
+        }
+
+        let mut cursor = Cursor::new(&buf);
+        for i in 0..3u32 {
+            let frame = EegmFrame::read_from(&mut cursor).unwrap().unwrap();
+            assert_eq!(frame.timestamp_us, (i as u64 + 1) * 1_000_000);
+        }
+    }
+
+    #[test]
+    fn timestamp_in_eegm_message_roundtrip() {
+        let channels = vec![vec![1.0f32; 4]; 4];
+        let ts: u64 = 42_000_000;
+        let frame = EegmFrame::with_timestamp(1, 10, &channels, 4, ts);
+        let mut buf = Vec::new();
+        frame.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        match EegmMessage::read_from(&mut cursor).unwrap().unwrap() {
+            EegmMessage::Data(decoded) => {
+                assert_eq!(decoded.timestamp_us, ts);
+                assert_eq!(decoded.headband_id, 1);
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
     }
 
     #[test]

@@ -249,6 +249,10 @@ fn main() -> Result<()> {
                         let seq = u32::from_le_bytes([hdr_rest[4], hdr_rest[5], hdr_rest[6], hdr_rest[7]]);
                         let nch = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]) as usize;
                         let ns = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]) as usize;
+                        let ts_us = u64::from_le_bytes([
+                            hdr_rest[16], hdr_rest[17], hdr_rest[18], hdr_rest[19],
+                            hdr_rest[20], hdr_rest[21], hdr_rest[22], hdr_rest[23],
+                        ]);
                         let payload_size = nch * ns * 4;
                         let mut payload = vec![0u8; payload_size];
                         if reader.read_exact(&mut payload).is_err() { break; }
@@ -283,7 +287,7 @@ fn main() -> Result<()> {
                         resp_count += 1;
                         log::info!(
                             "← #{resp_count} band={hid} seq={seq} {nch}ch×{ns}smp \
-                            latency={latency_str} RMS(µV): {}",
+                            ts={ts_us} latency={latency_str} RMS(µV): {}",
                             rms_parts.join(" "),
                         );
                     }
@@ -344,7 +348,11 @@ fn main() -> Result<()> {
                 }
             }
 
-            let frame = EegmFrame::new(h as u32, epoch_seq[h], &channels, chunk);
+            let timestamp_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let frame = EegmFrame::with_timestamp(h as u32, epoch_seq[h], &channels, chunk, timestamp_us);
             let encoded = frame.encode();
 
             // Record send time for latency tracking
