@@ -176,13 +176,13 @@ class ZunaWorker:
         preprocessing(
             input_dir=str(input_dir),
             output_dir=str(pt_in),
-            apply_notch_filter=False,
+            apply_notch_filter=True,
             apply_highpass_filter=True,
             apply_average_reference=True,
             preprocessed_fif_dir=str(pre_fif),
             drop_bad_channels=False,
             drop_bad_epochs=False,
-            zero_out_artifacts=False,
+            zero_out_artifacts=True,
             target_channel_count=self.target_channels,
             bad_channels=None,
         )
