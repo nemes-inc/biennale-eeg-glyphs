@@ -86,10 +86,16 @@ Python asyncio TCP server:
 - **Handshake**: waits for `ConnectReq`, validates headband count, replies `ConnectAck`
 - **EEGM parser**: reads data frames, routes to per-headband epoch buffers
 - **Epoch buffer**: accumulates 5s windows (1280 samples @ 256 Hz), 50% overlap hop
-- **ZUNA worker thread**: loads model on startup, processes epochs via temp-file shim
+- **Worker pool**: N parallel ZUNA model instances (default 4, configurable via `--workers`)
+  - Each worker loads its own model (~300–400 MB VRAM)
+  - Workers pull jobs from a shared thread-safe queue
+  - With RTX 4090 (24 GB), 8–16 workers fit comfortably
+  - Server waits for all workers to load before accepting connections
+  - Clean shutdown via poison pills
+- **ZUNA pipeline** (per worker, per epoch): temp-file shim
   (write .fif → `zuna.preprocessing()` → `zuna.inference()` → `zuna.pt_to_fif()` → read .fif)
 - **Result sender**: pushes reconstructed EEGM frames back to eeg-hub
-- **Queue management**: drops oldest epochs when queue exceeds 16 (server falling behind)
+- **Queue management**: drops epochs when queue exceeds 64 (server falling behind)
 - **Echo mode**: `--echo` flag returns frames without GPU processing (for testing)
 
 ### 4. Test tools
@@ -134,12 +140,12 @@ You should see the EEGC handshake logged on both sides, then frames being sent a
 
 ### Terminal 1+2 (with eeg-hub)
 ```bash
-# Terminal 1: inference server (echo)
+# Terminal 1: inference server (echo mode, no GPU)
 python -m inference_server.server --port 9100 --echo
 
-# Terminal 2: eeg-hub with server connection (no BLE — will timeout)
-./eeg-hub/target/release/eeg-hub --server 127.0.0.1:9100 --no-server
-# or just open the viewer without inference:
+# Terminal 2: eeg-hub connected to server
+./eeg-hub/target/release/eeg-hub --server 127.0.0.1:9100 --headbands 1
+# or viewer-only, no inference:
 ./eeg-hub/target/release/eeg-hub --no-server
 ```
 
@@ -150,7 +156,7 @@ python -m inference_server.server --port 9100 --echo
 ### GPU Server
 ```bash
 cd services/inference-server
-python -m inference_server.server --port 9100 --gpu-device 0
+python -m inference_server.server --port 9100 --gpu-device 0 --workers 8
 ```
 
 ### MacBook
@@ -175,9 +181,24 @@ Raw EEG (5s, 4ch) → MNE RawArray → temp .fif
     → read .fif → extract samples → EEGM response frame
 ```
 
-Each epoch: ~20–25s on RTX 4090. With 4 headbands producing epochs every 2.5s,
-the queue grows at ~1.6 epochs/s but drains at ~0.04–0.05 epochs/s per headband.
-The server drops old epochs to stay bounded.
+### Throughput analysis
+
+Each epoch: ~20–25s on RTX 4090 with a single worker.
+
+| Workers | VRAM used | Throughput (epochs/s) | Can keep up with |
+|---------|-----------|----------------------|-------------------|
+| 1       | ~400 MB   | ~0.04–0.05           | — (4–5× behind)    |
+| 4       | ~1.6 GB   | ~0.16–0.20           | — (still behind)  |
+| 8       | ~3.2 GB   | ~0.32–0.40           | 1 headband        |
+| 16      | ~6.4 GB   | ~0.64–0.80           | 2 headbands       |
+
+With 4 headbands producing epochs every 2.5s (50% overlap), the ingest rate is
+~1.6 epochs/s. Even with 16 workers the server falls behind, so the queue
+caps at 64 and drops oldest epochs. More workers = less delay.
+
+> **Note**: Actual GPU parallelism depends on compute contention. The numbers
+> above assume linear scaling; real throughput may plateau. Profile on the
+> target RTX 4090 to find the sweet spot.
 
 ---
 
@@ -185,7 +206,7 @@ The server drops old epochs to stay bounded.
 
 | Phase | Status | Scope |
 |-------|--------|-------|
-| **1** | ✅ Done | EEGM/EEGC protocol (data + connect handshake), inference-server skeleton, eeg-hub scaffolding, test sender |
+| **1** | ✅ Done | EEGM/EEGC protocol (data + connect handshake), inference-server with worker pool, eeg-hub scaffolding, test sender |
 | **2** | Planned | Single headband end-to-end with GPU inference |
 | **3** | Planned | Multi-headband GPU batching, epoch priority/scheduling |
 | **4** | Planned | UI polish (team), reconnection, latency monitor, recording |

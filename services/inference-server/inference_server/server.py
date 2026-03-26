@@ -4,15 +4,16 @@ EEG Inference Server — TCP server for multi-headband ZUNA inference.
 Architecture:
   - asyncio TCP server accepts one eeg-hub connection
   - Incoming EEGM frames are accumulated in per-headband EpochBuffers
-  - Complete epochs are queued for the ZUNA worker thread
+  - Complete epochs are queued for a pool of ZUNA worker threads
+  - Each worker loads its own ZUNA model instance (~300–400 MB VRAM each)
   - Reconstructed results are sent back as EEGM response frames
 
-Since ZUNA inference is ~4-5× slower than real-time, the server processes
-epochs asynchronously.  The eeg-hub displays raw data live and overlays
-processed results as they arrive (delayed).
+Since ZUNA inference is ~4-5× slower than real-time, running multiple workers
+in parallel reduces effective latency proportionally.  With an RTX 4090 (24 GB)
+and ~400 MB per instance, 8–16 workers can run concurrently.
 
 Usage:
-    python -m inference_server.server --port 9100
+    python -m inference_server.server --port 9100 --workers 8
     python -m inference_server.server --port 9100 --echo   # no GPU, just echo back
 """
 
@@ -21,11 +22,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import queue
 import signal
 import sys
 import threading
 import time
-from collections import deque
 
 from .eegm_protocol import (
     ConnectAck,
@@ -40,8 +41,11 @@ from .zuna_worker import InferenceJob, InferenceResult, ZunaWorker
 
 log = logging.getLogger(__name__)
 
-# Maximum pending epochs in the inference queue before dropping oldest.
-MAX_QUEUE_DEPTH = 16
+# Maximum pending epochs in the inference queue before back-pressure.
+MAX_QUEUE_DEPTH = 64
+
+# Default number of parallel ZUNA worker threads.
+DEFAULT_WORKERS = 4
 
 
 class InferenceServer:
@@ -55,6 +59,7 @@ class InferenceServer:
         gpu_device: int | str = 0,
         diffusion_steps: int = 50,
         target_channels: list[str] | None = None,
+        num_workers: int = DEFAULT_WORKERS,
     ) -> None:
         self.host = host
         self.port = port
@@ -62,6 +67,7 @@ class InferenceServer:
         self.gpu_device = gpu_device
         self.diffusion_steps = diffusion_steps
         self.target_channels = target_channels
+        self.num_workers = max(1, num_workers)
 
         # Per-headband epoch buffers
         self.buffers: list[EpochBuffer] = [
@@ -70,16 +76,23 @@ class InferenceServer:
         # Per-headband epoch sequence counters (for outgoing frames)
         self.out_seq: list[int] = [0] * MAX_HEADBANDS
 
-        # Inference queue (worker thread pulls from here)
-        self._job_queue: deque[InferenceJob] = deque(maxlen=MAX_QUEUE_DEPTH)
-        self._job_event = threading.Event()
+        # Thread-safe job queue (multiple workers pull from here)
+        self._job_queue: queue.Queue[InferenceJob | None] = queue.Queue(
+            maxsize=MAX_QUEUE_DEPTH
+        )
 
-        # Results queue (worker pushes, asyncio loop reads)
+        # Results queue (workers push, asyncio loop reads)
         self._result_queue: asyncio.Queue[InferenceResult] = asyncio.Queue()
 
         # Active writer (only one hub connection at a time)
         self._writer: asyncio.StreamWriter | None = None
         self._running = True
+
+        # Worker threads
+        self._worker_threads: list[threading.Thread] = []
+        self._workers_ready = threading.Event()
+        self._workers_loaded = 0
+        self._workers_lock = threading.Lock()
 
         # Stats
         self.frames_received = 0
@@ -88,9 +101,17 @@ class InferenceServer:
         self.epochs_dropped = 0
 
     async def start(self) -> None:
-        """Start the TCP server and worker thread."""
+        """Start the TCP server and worker pool."""
         if not self.echo_mode:
-            self._start_worker_thread()
+            self._start_worker_pool()
+            log.info(
+                "Waiting for %d ZUNA worker(s) to load models…",
+                self.num_workers,
+            )
+            # Wait in a non-blocking way so asyncio loop stays responsive
+            while not self._workers_ready.is_set():
+                await asyncio.sleep(0.5)
+            log.info("All %d workers ready.", self.num_workers)
 
         server = await asyncio.start_server(
             self._handle_client, self.host, self.port
@@ -167,16 +188,17 @@ class InferenceServer:
                     if epoch is None:
                         break
                     job = InferenceJob(headband_id=hid, epoch=epoch)
-                    if len(self._job_queue) >= MAX_QUEUE_DEPTH:
+                    try:
+                        self._job_queue.put_nowait(job)
+                        self.epochs_queued += 1
+                    except queue.Full:
                         self.epochs_dropped += 1
                         log.warning(
-                            "Inference queue full — dropping oldest epoch "
-                            "(dropped=%d)",
+                            "Inference queue full (%d) — dropping epoch "
+                            "(total dropped=%d)",
+                            MAX_QUEUE_DEPTH,
                             self.epochs_dropped,
                         )
-                    self._job_queue.append(job)
-                    self._job_event.set()
-                    self.epochs_queued += 1
 
         except Exception:
             log.exception("Error handling hub connection %s", addr)
@@ -274,13 +296,24 @@ class InferenceServer:
             except Exception:
                 log.exception("Failed to send result frame")
 
-    def _start_worker_thread(self) -> None:
-        """Start the ZUNA inference worker in a background thread."""
-        t = threading.Thread(target=self._worker_loop, daemon=True)
-        t.start()
+    def _start_worker_pool(self) -> None:
+        """Start N ZUNA inference workers in background threads."""
+        log.info("Starting %d ZUNA worker thread(s)…", self.num_workers)
+        for wid in range(self.num_workers):
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(wid,),
+                daemon=True,
+                name=f"zuna-worker-{wid}",
+            )
+            t.start()
+            self._worker_threads.append(t)
 
-    def _worker_loop(self) -> None:
-        """Worker thread: load model, process epochs from queue."""
+    def _worker_loop(self, worker_id: int) -> None:
+        """Worker thread: load own model instance, process epochs from shared queue."""
+        wlog = logging.getLogger(f"{__name__}.worker-{worker_id}")
+        wlog.info("Worker %d starting — loading ZUNA model…", worker_id)
+
         worker = ZunaWorker(
             gpu_device=self.gpu_device,
             diffusion_steps=self.diffusion_steps,
@@ -290,47 +323,69 @@ class InferenceServer:
         try:
             worker.load_model()
         except Exception:
-            log.exception("Failed to load ZUNA model — worker exiting")
+            wlog.exception("Worker %d: failed to load ZUNA model — exiting", worker_id)
             return
+        finally:
+            with self._workers_lock:
+                self._workers_loaded += 1
+                if self._workers_loaded >= self.num_workers:
+                    self._workers_ready.set()
 
+        wlog.info("Worker %d ready.", worker_id)
         loop = asyncio.get_event_loop()
 
         while self._running:
-            self._job_event.wait(timeout=1.0)
-            self._job_event.clear()
+            try:
+                job = self._job_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
 
-            while self._job_queue:
-                job = self._job_queue.popleft()
-                t0 = time.monotonic()
-                log.info(
-                    "Processing epoch: headband=%d seq=%d",
+            if job is None:
+                # Poison pill — shutdown signal
+                break
+
+            t0 = time.monotonic()
+            wlog.info(
+                "[W%d] Processing epoch: headband=%d seq=%d (queue=%d)",
+                worker_id,
+                job.headband_id,
+                job.epoch.seq,
+                self._job_queue.qsize(),
+            )
+
+            result = worker.process_epoch(job)
+            elapsed = time.monotonic() - t0
+
+            if result is not None:
+                wlog.info(
+                    "[W%d] Epoch done: headband=%d seq=%d → %d ch × %d samples (%.1fs)",
+                    worker_id,
+                    result.headband_id,
+                    result.epoch_seq,
+                    result.n_channels,
+                    result.n_samples,
+                    elapsed,
+                )
+                loop.call_soon_threadsafe(self._result_queue.put_nowait, result)
+            else:
+                wlog.warning(
+                    "[W%d] Epoch failed: headband=%d seq=%d (%.1fs)",
+                    worker_id,
                     job.headband_id,
                     job.epoch.seq,
+                    elapsed,
                 )
 
-                result = worker.process_epoch(job)
-                elapsed = time.monotonic() - t0
-
-                if result is not None:
-                    log.info(
-                        "Epoch done: headband=%d seq=%d → %d ch × %d samples (%.1fs)",
-                        result.headband_id,
-                        result.epoch_seq,
-                        result.n_channels,
-                        result.n_samples,
-                        elapsed,
-                    )
-                    loop.call_soon_threadsafe(self._result_queue.put_nowait, result)
-                else:
-                    log.warning(
-                        "Epoch failed: headband=%d seq=%d (%.1fs)",
-                        job.headband_id,
-                        job.epoch.seq,
-                        elapsed,
-                    )
+        wlog.info("Worker %d exiting.", worker_id)
 
     def shutdown(self) -> None:
         self._running = False
+        # Send poison pills to all workers so they exit cleanly
+        for _ in self._worker_threads:
+            try:
+                self._job_queue.put_nowait(None)
+            except queue.Full:
+                pass
 
 
 def main() -> None:
@@ -352,6 +407,13 @@ def main() -> None:
         "--echo",
         action="store_true",
         help="Echo mode: return frames without GPU inference (for testing)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Number of parallel ZUNA model instances (default: {DEFAULT_WORKERS}). "
+        "Each uses ~300–400 MB VRAM.",
     )
     parser.add_argument(
         "--gpu-device",
@@ -396,6 +458,7 @@ def main() -> None:
         gpu_device=gpu,
         diffusion_steps=args.diffusion_steps,
         target_channels=target_ch,
+        num_workers=args.workers,
     )
 
     loop = asyncio.new_event_loop()
