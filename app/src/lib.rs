@@ -66,6 +66,7 @@
 //! | [`parse`] | Low-level byte-to-sample decoders for EEG, IMU, PPG, and Athena packets |
 
 pub mod compute;
+pub mod eegm;
 pub mod muse_client;
 pub mod filters;
 pub mod parse;
