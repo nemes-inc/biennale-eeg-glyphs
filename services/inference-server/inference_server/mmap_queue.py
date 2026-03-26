@@ -18,12 +18,13 @@ Ring header (3 × uint64):
     count – current occupancy
 
 Each slot:
-    tag        int8    (1 = job, -1 = poison pill / None sentinel)
-    headband_id int32
-    seq         uint32
-    n_channels  uint32
-    n_samples   uint32
-    data        float64[max_channels × max_samples]
+    tag          int8    (1 = job, -1 = poison pill / None sentinel)
+    headband_id  int32
+    seq          uint32
+    n_channels   uint32
+    n_samples    uint32
+    timestamp_us uint64
+    data         float64[max_channels × max_samples]
 """
 
 from __future__ import annotations
@@ -44,8 +45,8 @@ from .zuna_worker import InferenceJob
 _RING_HDR = struct.Struct("<QQQ")  # head, tail, count
 _RING_HDR_SIZE = _RING_HDR.size  # 24
 
-_SLOT_HDR = struct.Struct("<b i I I I")  # tag, headband_id, seq, n_ch, n_samp
-_SLOT_HDR_SIZE = _SLOT_HDR.size  # 17
+_SLOT_HDR = struct.Struct("<b i I I I Q")  # tag, headband_id, seq, n_ch, n_samp, timestamp_us
+_SLOT_HDR_SIZE = _SLOT_HDR.size  # 25
 
 _F64 = 8  # sizeof(float64)
 
@@ -158,7 +159,7 @@ class MmapJobQueue:
 
         if item is None:
             # Poison pill: tag = -1
-            _SLOT_HDR.pack_into(self._mm, off, -1, 0, 0, 0, 0)
+            _SLOT_HDR.pack_into(self._mm, off, -1, 0, 0, 0, 0, 0)
             return
 
         epoch = item.epoch
@@ -172,7 +173,8 @@ class MmapJobQueue:
         )
 
         _SLOT_HDR.pack_into(
-            self._mm, off, 1, item.headband_id, epoch.seq, n_ch, n_samp
+            self._mm, off, 1, item.headband_id, epoch.seq, n_ch, n_samp,
+            epoch.timestamp_us,
         )
 
         data_off = off + _SLOT_HDR_SIZE
@@ -186,7 +188,7 @@ class MmapJobQueue:
 
     def _read_slot(self, index: int) -> InferenceJob | None:
         off = self._slot_offset(index)
-        tag, headband_id, seq, n_ch, n_samp = _SLOT_HDR.unpack_from(
+        tag, headband_id, seq, n_ch, n_samp, timestamp_us = _SLOT_HDR.unpack_from(
             self._mm, off
         )
 
@@ -203,5 +205,5 @@ class MmapJobQueue:
             )
             channels.append(samples)
 
-        epoch = Epoch(seq=seq, channels=channels)
+        epoch = Epoch(seq=seq, channels=channels, timestamp_us=timestamp_us)
         return InferenceJob(headband_id=headband_id, epoch=epoch)
