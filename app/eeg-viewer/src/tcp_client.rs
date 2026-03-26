@@ -15,9 +15,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 
 use crate::device_state::{
-    extract_channels_from_frame, read_session_frames, DeviceState, HeadbandId, OutboundRx,
+    extract_channels_from_frame, read_session_frames, DeviceState, OutboundRx,
     ServerState,
 };
+
+/// Shared device map — updated by main thread when devices connect/disconnect.
+/// TCP recv task reads from this to route reconstructed frames.
+pub type DeviceMap = Arc<Mutex<HashMap<u32, Arc<Mutex<DeviceState>>>>>;
 
 /// Session replay info for one device: path + how many frames already sent.
 pub struct SessionReplayInfo {
@@ -34,7 +38,7 @@ pub fn spawn_tcp_client(
     n_headbands: u32,
     sample_rate: u32,
     server_state: Arc<Mutex<ServerState>>,
-    device_states: Vec<(HeadbandId, Arc<Mutex<DeviceState>>)>,
+    device_map: DeviceMap,
     mut outbound_rx: OutboundRx,
     session_replays: Vec<SessionReplayInfo>,
 ) -> tokio::task::JoinHandle<()> {
@@ -172,28 +176,41 @@ pub fn spawn_tcp_client(
         );
 
         // ── Streaming ──────────────────────────────────────────────────
-        let device_map: HashMap<u32, Arc<Mutex<DeviceState>>> = device_states
-            .into_iter()
-            .map(|(hid, state)| (hid.as_u32(), state))
-            .collect();
-
-        let device_map_send = device_map.clone();
+        // device_map is Arc<Mutex<HashMap>> — shared with main thread so
+        // devices that connect after the server are still routable.
+        let device_map_recv = Arc::clone(&device_map);
+        let device_map_send = Arc::clone(&device_map);
 
         let mut recv_task = tokio::spawn(async move {
+            let mut recv_count: u64 = 0;
             loop {
                 match read_eegm_message(&mut reader).await {
                     Ok(Some(frame)) => {
-                        if let Some(state) = device_map.get(&frame.headband_id) {
+                        recv_count += 1;
+                        if recv_count <= 3 || recv_count % 100 == 0 {
+                            info!(
+                                "Recv frame #{recv_count}: hid={} seq={} ch={} samp={}",
+                                frame.headband_id, frame.epoch_seq, frame.n_channels, frame.n_samples
+                            );
+                        }
+                        let map = device_map_recv.lock().unwrap();
+                        if let Some(state) = map.get(&frame.headband_id) {
                             let channels = extract_channels_from_frame(&frame);
                             state.lock().unwrap().push_reconstructed_frame(channels);
+                        } else if recv_count <= 5 {
+                            warn!(
+                                "No device for headband_id={}, known ids: {:?}",
+                                frame.headband_id,
+                                map.keys().collect::<Vec<_>>()
+                            );
                         }
                     }
                     Ok(None) => {
-                        info!("Inference server closed connection");
+                        info!("Inference server closed connection (recv_count={recv_count})");
                         break;
                     }
                     Err(e) => {
-                        error!("Error reading from inference server: {e}");
+                        error!("Error reading from inference server: {e} (recv_count={recv_count})");
                         break;
                     }
                 }
@@ -201,8 +218,14 @@ pub fn spawn_tcp_client(
         });
 
         let mut send_task = tokio::spawn(async move {
+            let mut send_count: u64 = 0;
+            info!("TCP send task started, waiting for outbound frames…");
             while let Some(frame) = outbound_rx.recv().await {
+                send_count += 1;
                 let hid = frame.headband_id;
+                if send_count <= 3 || send_count % 100 == 0 {
+                    info!("TCP send #{send_count}: hid={hid} seq={}", frame.epoch_seq);
+                }
                 let encoded = frame.encode();
                 if let Err(e) = writer.write_all(&encoded).await {
                     error!("Error writing to inference server: {e}");
@@ -213,10 +236,12 @@ pub fn spawn_tcp_client(
                     break;
                 }
                 // Track frames sent per device
-                if let Some(state) = device_map_send.get(&hid) {
+                let map = device_map_send.lock().unwrap();
+                if let Some(state) = map.get(&hid) {
                     state.lock().unwrap().session_frames_sent += 1;
                 }
             }
+            info!("TCP send task exiting (sent {send_count} total)");
         });
 
         tokio::select! {

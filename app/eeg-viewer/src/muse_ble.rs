@@ -14,8 +14,8 @@ use muse_rs::muse_client::{MuseClient, MuseClientConfig, MuseDevice};
 use muse_rs::types::MuseEvent;
 
 use crate::device_state::{
-    build_eegm_frame, chunk_ready, drain_chunk, DeviceState, HeadbandId, OutboundTx,
-    SessionWriter,
+    build_eegm_frame, chunk_ready, drain_chunk, DeviceState, HeadbandId, SessionWriter,
+    SharedOutboundTx,
 };
 
 /// Samples to accumulate before flushing to shared state.
@@ -85,7 +85,7 @@ pub fn spawn_device_ble_task(
     device: MuseDevice,
     headband_id: HeadbandId,
     state: Arc<Mutex<DeviceState>>,
-    outbound_tx: Option<OutboundTx>,
+    outbound_tx: SharedOutboundTx,
     session_path: Option<PathBuf>,
     rt: &tokio::runtime::Runtime,
 ) -> DeviceBleHandle {
@@ -121,7 +121,7 @@ async fn run_device_ble_loop(
     headband_id: HeadbandId,
     state: Arc<Mutex<DeviceState>>,
     stop: Arc<AtomicBool>,
-    outbound_tx: Option<OutboundTx>,
+    outbound_tx: SharedOutboundTx,
     session_path: Option<PathBuf>,
 ) -> Result<()> {
     {
@@ -189,8 +189,9 @@ async fn run_device_ble_loop(
                             }
 
                             // Then send to inference server
-                            if let Some(ref tx) = outbound_tx {
-                                let _ = tx.send(eegm);
+                            let sent = outbound_tx.send(eegm);
+                            if epoch_seq < 3 || epoch_seq % 100 == 0 {
+                                info!("BLE outbound send seq={epoch_seq} sent={sent}");
                             }
                             epoch_seq = epoch_seq.wrapping_add(1);
 

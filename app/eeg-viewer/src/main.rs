@@ -29,9 +29,10 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use device_state::{
     clamp_tab_index, device_fif_path, next_available_headband_id, session_file_path,
-    ConnectedDevice, DeviceState, OutboundTx, ServerState,
+    ConnectedDevice, DeviceState, ServerState, SharedOutboundTx,
 };
 use muse_ble::ScanResult;
+use tcp_client::DeviceMap;
 
 const MAGIC_SINGLE: u32 = 0x4545_4746; // "EEGF"
 const MAGIC_DUAL: u32 = 0x4545_4744; // "EEGD"
@@ -150,7 +151,8 @@ struct EegViewerApp {
     // ── Inference server ──
     server_state: Arc<Mutex<ServerState>>,
     server_addr: Option<String>,
-    outbound_tx: Option<OutboundTx>,
+    outbound_tx: SharedOutboundTx,
+    device_map: DeviceMap,
 
     // ── Display toggles ──
     show_live: bool,
@@ -280,6 +282,12 @@ impl EegViewerApp {
             &self.tokio_rt,
         );
 
+        // Register in shared device map so TCP recv/send tasks can route by headband_id
+        self.device_map
+            .lock()
+            .unwrap()
+            .insert(headband_id.as_u32(), Arc::clone(&state));
+
         self.connected_devices.push(ConnectedDevice {
             device_name: display_label,
             device_id,
@@ -303,6 +311,10 @@ impl EegViewerApp {
         }
         let device = self.connected_devices.remove(idx);
         device.stop_flag.store(true, Ordering::SeqCst);
+        self.device_map
+            .lock()
+            .unwrap()
+            .remove(&device.headband_id.as_u32());
         self.active_tab = clamp_tab_index(self.active_tab, self.connected_devices.len());
     }
 
@@ -314,15 +326,11 @@ impl EegViewerApp {
             return;
         }
 
-        let (tx, rx) = device_state::outbound_channel();
-        self.outbound_tx = Some(tx);
+        // Create a fresh channel inside SharedOutboundTx. BLE tasks that
+        // already hold a clone will pick up the new sender on their next send.
+        let rx = self.outbound_tx.reset_channel();
 
         let n_headbands = self.connected_devices.len().max(1) as u32;
-        let device_states: Vec<_> = self
-            .connected_devices
-            .iter()
-            .map(|d| (d.headband_id, Arc::clone(&d.state)))
-            .collect();
 
         // Collect session replay info for auto-replay of unsent frames
         let session_replays: Vec<_> = self
@@ -344,7 +352,7 @@ impl EegViewerApp {
             n_headbands,
             SAMPLE_RATE_HZ,
             Arc::clone(&self.server_state),
-            device_states,
+            Arc::clone(&self.device_map),
             rx,
             session_replays,
         );
@@ -1486,7 +1494,8 @@ fn main() -> eframe::Result<()> {
                 show_device_picker: false,
                 server_state,
                 server_addr,
-                outbound_tx: None,
+                outbound_tx: SharedOutboundTx::new(),
+                device_map: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 show_live: true,
                 show_raw: true,
                 show_reconstructed: true,
