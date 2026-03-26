@@ -1,13 +1,22 @@
-//! **eegm-test-sender** — synthetic EEGM frame generator for testing the
-//! multi-headband inference pipeline without real Muse headsets.
+//! **eegm-test-sender** — synthetic multi-headband EEGM frame generator.
 //!
-//! Connects to the inference server and sends synthetic 4-channel EEG
-//! (10 Hz alpha + noise) as EEGM frames for 1–4 simulated headbands.
+//! Connects to the inference server and sends synthetic 4-channel EEG for
+//! 1–4 simulated headbands, each with a distinct signal profile:
+//!
+//! - **Band 0**: strong 10 Hz alpha — relaxed subject, eyes closed
+//! - **Band 1**: 6 Hz theta dominant — drowsy/meditative subject
+//! - **Band 2**: 20 Hz beta dominant — alert/focused subject
+//! - **Band 3**: mixed alpha + theta — transitional state
+//!
+//! Each headband also has per-channel amplitude scaling (temporal channels
+//! weaker than frontal, matching real Muse topology) and periodic eye-blink
+//! artifacts on the frontal channels (AF7, AF8).
 //!
 //! Usage:
 //! ```text
-//! eegm-test-sender --target 127.0.0.1:9100
-//! eegm-test-sender --target 127.0.0.1:9100 --headbands 4 --chunk 64
+//! eegm-test-sender --target 127.0.0.1:9100 --headbands 4
+//! eegm-test-sender --target 127.0.0.1:9100 --headbands 2 --chunk 64
+//! eegm-test-sender --target 127.0.0.1:9100 --headbands 1 --duration 30
 //! ```
 
 use std::io::{Read, Write};
@@ -24,7 +33,7 @@ use muse_rs::eegm::{ConnectReq, EegmFrame, CTRL_SIZE, HEADER_SIZE, MAGIC_EEGC, M
 /// Simulated sample rate (Muse = 256 Hz).
 const SAMPLE_RATE: f64 = 256.0;
 
-/// Number of EEG channels per headband.
+/// Number of EEG channels per headband (TP9, AF7, AF8, TP10).
 const NUM_CHANNELS: usize = 4;
 
 #[derive(Parser, Debug)]
@@ -38,24 +47,16 @@ struct Args {
     target: String,
 
     /// Number of simulated headbands (1–4).
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     headbands: usize,
 
     /// Samples per channel per EEGM frame.
     #[arg(long, default_value_t = 256)]
     chunk: usize,
 
-    /// Alpha frequency in Hz.
-    #[arg(long, default_value_t = 10.0)]
-    alpha_hz: f64,
-
-    /// Alpha amplitude in µV.
-    #[arg(long, default_value_t = 15.0)]
-    alpha_amp: f64,
-
-    /// Noise amplitude in µV (Gaussian).
-    #[arg(long, default_value_t = 5.0)]
-    noise_amp: f64,
+    /// Global amplitude scale factor (1.0 = typical Muse µV levels).
+    #[arg(long, default_value_t = 1.0)]
+    amplitude: f64,
 
     /// Total duration in seconds (0 = run forever until Ctrl-C).
     #[arg(long, default_value_t = 0)]
@@ -86,9 +87,69 @@ impl SimpleRng {
     }
 }
 
-/// Per-channel phase offsets for visual distinction.
-const PHASE_OFFSETS: [f64; NUM_CHANNELS] = [0.0, 0.3, 0.6, 0.9];
-const AMP_SCALE: [f64; NUM_CHANNELS] = [0.6, 1.0, 1.0, 0.6];
+/// Per-channel amplitude scaling: temporal (TP9/TP10) weaker than frontal (AF7/AF8).
+const CH_AMP_SCALE: [f64; NUM_CHANNELS] = [0.6, 1.0, 1.0, 0.6];
+
+/// Signal profile for one simulated headband.
+struct HeadbandProfile {
+    /// Human-readable label.
+    label: &'static str,
+    /// Oscillatory components: (frequency_hz, amplitude_uv, phase_offset).
+    oscillations: Vec<(f64, f64, f64)>,
+    /// Background noise amplitude in µV.
+    noise_amp: f64,
+    /// Eye-blink interval in seconds (0 = no blinks).
+    blink_interval: f64,
+    /// Eye-blink amplitude in µV (added to AF7/AF8 only).
+    blink_amp: f64,
+}
+
+fn headband_profiles() -> Vec<HeadbandProfile> {
+    vec![
+        HeadbandProfile {
+            label: "alpha-dominant (relaxed, eyes closed)",
+            oscillations: vec![
+                (10.0, 18.0, 0.0),   // strong alpha
+                (20.0, 3.0, 0.5),    // weak beta harmonic
+            ],
+            noise_amp: 4.0,
+            blink_interval: 4.0,
+            blink_amp: 80.0,
+        },
+        HeadbandProfile {
+            label: "theta-dominant (drowsy/meditative)",
+            oscillations: vec![
+                (6.0, 14.0, 0.0),    // dominant theta
+                (10.0, 5.0, 0.3),    // mild alpha
+            ],
+            noise_amp: 5.0,
+            blink_interval: 6.0,
+            blink_amp: 60.0,
+        },
+        HeadbandProfile {
+            label: "beta-dominant (alert/focused)",
+            oscillations: vec![
+                (20.0, 10.0, 0.0),   // dominant beta
+                (10.0, 4.0, 0.7),    // suppressed alpha
+                (40.0, 2.0, 0.2),    // weak gamma
+            ],
+            noise_amp: 6.0,
+            blink_interval: 3.0,
+            blink_amp: 90.0,
+        },
+        HeadbandProfile {
+            label: "mixed alpha+theta (transitional)",
+            oscillations: vec![
+                (10.0, 12.0, 0.0),   // moderate alpha
+                (6.0, 10.0, 0.4),    // moderate theta
+                (13.0, 3.0, 0.9),    // SMR component
+            ],
+            noise_amp: 5.0,
+            blink_interval: 5.0,
+            blink_amp: 70.0,
+        },
+    ]
+}
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -131,9 +192,25 @@ fn main() -> Result<()> {
     let ack_sr = u32::from_le_bytes([ack_buf[16], ack_buf[17], ack_buf[18], ack_buf[19]]);
     log::info!("ConnectAck OK — server accepted {ack_hb} headband(s) @ {ack_sr} Hz");
 
+    // ── Log headband profiles ──────────────────────────────────────────
+    let profiles = headband_profiles();
+    for h in 0..n_headbands {
+        let p = &profiles[h % profiles.len()];
+        let osc_desc: Vec<String> = p.oscillations.iter()
+            .map(|(f, a, _)| format!("{f:.0} Hz @ {a:.0} µV"))
+            .collect();
+        log::info!(
+            "Headband {h}: {} — [{}], noise={:.0} µV, blinks every {:.0}s",
+            p.label,
+            osc_desc.join(", "),
+            p.noise_amp,
+            p.blink_interval,
+        );
+    }
     log::info!(
-        "Streaming {} headband(s), chunk={chunk}.",
-        n_headbands
+        "Streaming {} headband(s), chunk={chunk}, amp_scale={:.1}",
+        n_headbands,
+        args.amplitude,
     );
 
     // Optional: spawn a thread to read responses
@@ -141,20 +218,29 @@ fn main() -> Result<()> {
         let mut reader = stream.try_clone()?;
         let r = Arc::clone(&running);
         std::thread::spawn(move || {
-            let mut hdr = [0u8; HEADER_SIZE];
+            let mut magic_buf = [0u8; 4];
             loop {
                 if !r.load(Ordering::SeqCst) { break; }
-                match reader.read_exact(&mut hdr) {
+                match reader.read_exact(&mut magic_buf) {
                     Ok(()) => {
-                        let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+                        let magic = u32::from_le_bytes(magic_buf);
+                        if magic == MAGIC_EEGC {
+                            // Skip control message body
+                            let mut skip = [0u8; CTRL_SIZE - 4];
+                            if reader.read_exact(&mut skip).is_err() { break; }
+                            log::debug!("← Skipping EEGC control message");
+                            continue;
+                        }
                         if magic != MAGIC_EEGM {
                             log::warn!("Bad response magic: 0x{magic:08X}");
                             break;
                         }
-                        let hid = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-                        let seq = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
-                        let nch = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
-                        let ns = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+                        let mut hdr_rest = [0u8; HEADER_SIZE - 4];
+                        if reader.read_exact(&mut hdr_rest).is_err() { break; }
+                        let hid = u32::from_le_bytes([hdr_rest[0], hdr_rest[1], hdr_rest[2], hdr_rest[3]]);
+                        let seq = u32::from_le_bytes([hdr_rest[4], hdr_rest[5], hdr_rest[6], hdr_rest[7]]);
+                        let nch = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]);
+                        let ns = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
                         let payload_size = (nch as usize) * (ns as usize) * 4;
                         let mut payload = vec![0u8; payload_size];
                         if reader.read_exact(&mut payload).is_err() { break; }
@@ -168,6 +254,7 @@ fn main() -> Result<()> {
         });
     }
 
+    // ── Signal generation ────────────────────────────────────────────────
     let mut rngs: Vec<SimpleRng> = (0..n_headbands)
         .map(|h| SimpleRng::new(42 + h as u64 * 1000))
         .collect();
@@ -180,24 +267,41 @@ fn main() -> Result<()> {
     } else {
         u64::MAX
     };
+    let two_pi = 2.0 * std::f64::consts::PI;
 
     while running.load(Ordering::SeqCst) && sample_idx[0] < total_samples {
         for h in 0..n_headbands {
+            let profile = &profiles[h % profiles.len()];
             let mut channels: Vec<Vec<f32>> = vec![Vec::with_capacity(chunk); NUM_CHANNELS];
 
             for s in 0..chunk {
                 let t = (sample_idx[h] + s as u64) as f64 / SAMPLE_RATE;
-                // Per-headband frequency offset for distinction
-                let freq_offset = h as f64 * 0.5;
 
                 for ch in 0..NUM_CHANNELS {
-                    let alpha = args.alpha_amp
-                        * AMP_SCALE[ch]
-                        * (2.0 * std::f64::consts::PI * (args.alpha_hz + freq_offset) * t
-                            + PHASE_OFFSETS[ch])
-                            .sin();
-                    let noise = args.noise_amp * rngs[h].next_gaussian();
-                    channels[ch].push((alpha + noise) as f32);
+                    // Sum oscillatory components
+                    let mut val = 0.0_f64;
+                    for &(freq, amp, phase) in &profile.oscillations {
+                        val += amp * CH_AMP_SCALE[ch]
+                            * (two_pi * freq * t + phase).sin();
+                    }
+
+                    // Gaussian noise
+                    val += profile.noise_amp * rngs[h].next_gaussian();
+
+                    // Eye-blink artifacts on frontal channels (AF7=ch1, AF8=ch2)
+                    if profile.blink_interval > 0.0 && (ch == 1 || ch == 2) {
+                        let blink_phase = t % profile.blink_interval;
+                        // Blink is a ~150 ms Gaussian pulse
+                        if blink_phase < 0.15 {
+                            let blink_t = blink_phase / 0.075 - 1.0; // centered at 75ms
+                            val += profile.blink_amp * (-0.5 * blink_t * blink_t).exp();
+                        }
+                    }
+
+                    // Global amplitude scaling
+                    val *= args.amplitude;
+
+                    channels[ch].push(val as f32);
                 }
             }
 
@@ -216,7 +320,7 @@ fn main() -> Result<()> {
         if total_frames % (10 * n_headbands as u64) == 0 {
             let elapsed = sample_idx[0] as f64 / SAMPLE_RATE;
             log::info!(
-                "Sent {total_frames} frames total ({elapsed:.1}s simulated, {n_headbands} headband(s))"
+                "Sent {total_frames} frames ({elapsed:.1}s simulated × {n_headbands} headband(s))"
             );
         }
 
