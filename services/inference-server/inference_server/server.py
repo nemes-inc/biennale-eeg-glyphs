@@ -36,13 +36,14 @@ from .eegm_protocol import (
     write_frame,
     write_message,
 )
-from .epoch_buffer import EpochBuffer, MAX_HEADBANDS
+from .epoch_buffer import EpochBuffer, MAX_HEADBANDS, EPOCH_SAMPLES, NUM_MUSE_CHANNELS
+from .mmap_queue import MmapJobQueue
 from .zuna_worker import InferenceJob, InferenceResult, ZunaWorker
 
 log = logging.getLogger(__name__)
 
 # Maximum pending epochs in the inference queue before back-pressure.
-MAX_QUEUE_DEPTH = 64
+MAX_QUEUE_DEPTH = 1024
 
 # Default number of parallel ZUNA worker threads.
 DEFAULT_WORKERS = 4
@@ -76,9 +77,12 @@ class InferenceServer:
         # Per-headband epoch sequence counters (for outgoing frames)
         self.out_seq: list[int] = [0] * MAX_HEADBANDS
 
-        # Thread-safe job queue (multiple workers pull from here)
-        self._job_queue: queue.Queue[InferenceJob | None] = queue.Queue(
-            maxsize=MAX_QUEUE_DEPTH
+        # Thread-safe job queue backed by a memory-mapped file so epoch
+        # data lives on disk (via kernel page cache) instead of Python heap.
+        self._job_queue = MmapJobQueue(
+            maxsize=MAX_QUEUE_DEPTH,
+            max_channels=NUM_MUSE_CHANNELS,
+            max_samples=EPOCH_SAMPLES,
         )
 
         # Results queue (workers push, asyncio loop reads)
@@ -387,6 +391,8 @@ class InferenceServer:
                 self._job_queue.put_nowait(None)
             except queue.Full:
                 pass
+        # Clean up the mmap backing file
+        self._job_queue.close()
 
 
 def main() -> None:
