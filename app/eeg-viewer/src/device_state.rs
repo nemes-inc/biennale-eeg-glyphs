@@ -395,15 +395,6 @@ pub fn drain_chunk(buffers: &mut [Vec<f32>], chunk_size: usize) -> Vec<Vec<f32>>
         .collect()
 }
 
-/// Append samples to rolling buffer, trim to max_points.
-pub fn push_rolling(buffer: &mut Vec<f32>, samples: &[f32], max_points: usize) {
-    buffer.extend_from_slice(samples);
-    let excess = buffer.len().saturating_sub(max_points);
-    if excess > 0 {
-        buffer.drain(..excess);
-    }
-}
-
 /// Convert raw f32 samples to timed [time_secs, value] points.
 /// Samples are spaced at 1/SAMPLE_RATE from `base_secs`.
 fn samples_to_timed(samples: &[f32], base_secs: f64) -> Vec<[f64; 2]> {
@@ -523,22 +514,6 @@ mod tests {
         let chunk = drain_chunk(&mut buffers, 2);
         assert_eq!(chunk, vec![vec![1.0, 2.0], vec![4.0, 5.0]]);
         assert_eq!(buffers, vec![vec![3.0], vec![6.0]]);
-    }
-
-    // ── push_rolling ────────────────────────────────────────────────────
-
-    #[test]
-    fn push_rolling_trims_excess() {
-        let mut buf = vec![1.0, 2.0, 3.0];
-        push_rolling(&mut buf, &[4.0, 5.0], 4);
-        assert_eq!(buf, vec![2.0, 3.0, 4.0, 5.0]);
-    }
-
-    #[test]
-    fn push_rolling_no_trim_when_under_limit() {
-        let mut buf = vec![1.0];
-        push_rolling(&mut buf, &[2.0], 10);
-        assert_eq!(buf, vec![1.0, 2.0]);
     }
 
     // ── push_accumulating ───────────────────────────────────────────────

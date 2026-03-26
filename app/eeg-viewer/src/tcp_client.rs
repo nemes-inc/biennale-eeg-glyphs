@@ -189,8 +189,8 @@ pub fn spawn_tcp_client(
                         recv_count += 1;
                         if recv_count <= 3 || recv_count % 100 == 0 {
                             info!(
-                                "Recv frame #{recv_count}: hid={} seq={} ch={} samp={}",
-                                frame.headband_id, frame.epoch_seq, frame.n_channels, frame.n_samples
+                                "Recv frame #{recv_count}: hid={} seq={} ch={} samp={} ts_us={}",
+                                frame.headband_id, frame.epoch_seq, frame.n_channels, frame.n_samples, frame.timestamp_us
                             );
                         }
                         let map = device_map_recv.lock().unwrap();
