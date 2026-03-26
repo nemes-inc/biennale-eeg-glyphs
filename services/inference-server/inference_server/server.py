@@ -100,6 +100,9 @@ class InferenceServer:
         self.epochs_processed = 0
         self.epochs_dropped = 0
 
+        self._tcp_server = None
+        self._send_task: asyncio.Task | None = None
+
     async def start(self) -> None:
         """Start the TCP server and worker pool."""
         self._loop = asyncio.get_running_loop()
@@ -114,19 +117,22 @@ class InferenceServer:
                 await asyncio.sleep(0.5)
             log.info("All %d workers ready.", self.num_workers)
 
-        server = await asyncio.start_server(
+        self._tcp_server = await asyncio.start_server(
             self._handle_client, self.host, self.port
         )
-        addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
+        addrs = ", ".join(str(s.getsockname()) for s in self._tcp_server.sockets)
         log.info("Inference server listening on %s", addrs)
         if self.echo_mode:
             log.info("ECHO MODE — frames are returned without GPU inference")
 
         # Start result sender task
-        asyncio.create_task(self._send_results())
+        self._send_task = asyncio.create_task(self._send_results())
 
-        async with server:
-            await server.serve_forever()
+        async with self._tcp_server:
+            try:
+                await self._tcp_server.serve_forever()
+            except asyncio.CancelledError:
+                log.info("Server shutting down")
 
     async def _handle_client(
         self,
@@ -265,6 +271,12 @@ class InferenceServer:
 
     async def _send_results(self) -> None:
         """Send reconstructed frames back to the hub as they arrive."""
+        try:
+            await self._send_results_loop()
+        except asyncio.CancelledError:
+            log.debug("Result sender task cancelled — shutting down")
+
+    async def _send_results_loop(self) -> None:
         while self._running:
             try:
                 result = await asyncio.wait_for(
@@ -381,6 +393,11 @@ class InferenceServer:
 
     def shutdown(self) -> None:
         self._running = False
+        if self._send_task is not None:
+            self._send_task.cancel()
+            self._send_task = None
+        if self._tcp_server is not None:
+            self._tcp_server.close()
         # Send poison pills to all workers so they exit cleanly
         for _ in self._worker_threads:
             try:
@@ -474,6 +491,10 @@ def main() -> None:
         pass
     finally:
         server.shutdown()
+        # Let cancelled tasks finalize before closing the loop
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
 
