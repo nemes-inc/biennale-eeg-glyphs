@@ -19,11 +19,12 @@
 //! eegm-test-sender --target 127.0.0.1:9100 --headbands 1 --duration 30
 //! ```
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -62,9 +63,9 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     duration: u64,
 
-    /// Also read and log response frames from the server.
+    /// Disable reading/logging response frames from the server.
     #[arg(long)]
-    read_responses: bool,
+    no_responses: bool,
 }
 
 /// Simple xorshift64 PRNG.
@@ -213,11 +214,19 @@ fn main() -> Result<()> {
         args.amplitude,
     );
 
-    // Optional: spawn a thread to read responses
-    if args.read_responses {
+    // Shared map: (headband_id, epoch_seq) → Instant when frame was sent.
+    // The response reader looks up send times to compute round-trip latency.
+    let send_times: Arc<Mutex<HashMap<(u32, u32), Instant>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn response reader thread (unless --no-responses)
+    if !args.no_responses {
         let mut reader = stream.try_clone()?;
         let r = Arc::clone(&running);
+        let st = Arc::clone(&send_times);
         std::thread::spawn(move || {
+            let ch_names = ["TP9", "AF7", "AF8", "TP10"];
+            let mut resp_count: u64 = 0;
             let mut magic_buf = [0u8; 4];
             loop {
                 if !r.load(Ordering::SeqCst) { break; }
@@ -225,7 +234,6 @@ fn main() -> Result<()> {
                     Ok(()) => {
                         let magic = u32::from_le_bytes(magic_buf);
                         if magic == MAGIC_EEGC {
-                            // Skip control message body
                             let mut skip = [0u8; CTRL_SIZE - 4];
                             if reader.read_exact(&mut skip).is_err() { break; }
                             log::debug!("← Skipping EEGC control message");
@@ -239,13 +247,44 @@ fn main() -> Result<()> {
                         if reader.read_exact(&mut hdr_rest).is_err() { break; }
                         let hid = u32::from_le_bytes([hdr_rest[0], hdr_rest[1], hdr_rest[2], hdr_rest[3]]);
                         let seq = u32::from_le_bytes([hdr_rest[4], hdr_rest[5], hdr_rest[6], hdr_rest[7]]);
-                        let nch = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]);
-                        let ns = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
-                        let payload_size = (nch as usize) * (ns as usize) * 4;
+                        let nch = u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]) as usize;
+                        let ns = u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]) as usize;
+                        let payload_size = nch * ns * 4;
                         let mut payload = vec![0u8; payload_size];
                         if reader.read_exact(&mut payload).is_err() { break; }
+
+                        // Compute round-trip latency
+                        let latency_str = {
+                            let mut map = st.lock().unwrap();
+                            if let Some(sent_at) = map.remove(&(hid, seq)) {
+                                format!("{:.1}s", sent_at.elapsed().as_secs_f64())
+                            } else {
+                                "?".to_string()
+                            }
+                        };
+
+                        // Compute per-channel RMS (µV)
+                        let mut rms_parts: Vec<String> = Vec::with_capacity(nch);
+                        for ch in 0..nch {
+                            let offset = ch * ns * 4;
+                            let mut sum_sq = 0.0_f64;
+                            for s in 0..ns {
+                                let i = offset + s * 4;
+                                let v = f32::from_le_bytes([
+                                    payload[i], payload[i+1], payload[i+2], payload[i+3],
+                                ]) as f64;
+                                sum_sq += v * v;
+                            }
+                            let rms = (sum_sq / ns as f64).sqrt();
+                            let name = if ch < ch_names.len() { ch_names[ch] } else { "?" };
+                            rms_parts.push(format!("{name}={rms:.1}"));
+                        }
+
+                        resp_count += 1;
                         log::info!(
-                            "← Response: headband={hid} seq={seq} {nch}ch×{ns}samples"
+                            "← #{resp_count} band={hid} seq={seq} {nch}ch×{ns}smp \
+                            latency={latency_str} RMS(µV): {}",
+                            rms_parts.join(" "),
                         );
                     }
                     Err(_) => break,
@@ -307,6 +346,17 @@ fn main() -> Result<()> {
 
             let frame = EegmFrame::new(h as u32, epoch_seq[h], &channels, chunk);
             let encoded = frame.encode();
+
+            // Record send time for latency tracking
+            if let Ok(mut map) = send_times.lock() {
+                map.insert((h as u32, epoch_seq[h]), Instant::now());
+                // Prune old entries (keep last 256 per headband)
+                if map.len() > 1024 {
+                    let cutoff = Instant::now() - Duration::from_secs(120);
+                    map.retain(|_, t| *t > cutoff);
+                }
+            }
+
             if let Err(e) = stream.write_all(&encoded) {
                 log::error!("TCP write failed: {e}");
                 return Err(e.into());
