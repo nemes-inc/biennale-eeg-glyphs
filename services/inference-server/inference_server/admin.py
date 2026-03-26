@@ -169,8 +169,16 @@ def _do_restart(server: InferenceServer) -> None:
     log.info("Executing restart...")
     server.shutdown()
 
-    # Re-exec: replaces this process with a fresh one using updated code
-    argv = [sys.executable] + sys.argv
+    # Reconstruct the original command line.
+    # When launched as `python -m inference_server.server`, sys.argv[0] is the
+    # path to server.py but we need `-m inference_server.server` for relative
+    # imports to work.  Detect this by checking if argv[0] ends with our module.
+    argv0 = sys.argv[0]
+    if argv0.endswith("inference_server/server.py") or argv0.endswith("inference_server\\server.py"):
+        argv = [sys.executable, "-m", "inference_server.server"] + sys.argv[1:]
+    else:
+        argv = [sys.executable] + sys.argv
+
     log.info("Re-exec: %s", " ".join(argv))
     os.execv(sys.executable, argv)
 
