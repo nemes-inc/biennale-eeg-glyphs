@@ -9,7 +9,8 @@ Wire format (little-endian):
     8       u32    epoch_seq
     12      u32    n_channels
     16      u32    n_samples per channel
-    20      f32[]  channel-major payload
+    20      u64    timestamp_us (microseconds, monotonic or epoch)
+    28      f32[]  channel-major payload
 
 Matches the Rust implementation in ``muse_rs::eegm``.
 """
@@ -21,9 +22,9 @@ from dataclasses import dataclass, field
 
 MAGIC_EEGM = 0x4545_474D
 MAGIC_EEGC = 0x4545_4743
-HEADER_SIZE = 20
+HEADER_SIZE = 28
 CTRL_SIZE = 24
-HEADER_FMT = "<5I"  # 5 × u32 little-endian
+HEADER_FMT = "<5IQ"  # 5 × u32 + 1 × u64 little-endian
 CTRL_FMT = "<6I"   # 6 × u32 little-endian
 MAX_HEADBANDS = 4
 PROTOCOL_VERSION = 1
@@ -97,6 +98,7 @@ class EegmFrame:
     epoch_seq: int
     n_channels: int
     n_samples: int
+    timestamp_us: int = 0
     data: list[float] = field(default_factory=list)
 
     @staticmethod
@@ -105,6 +107,7 @@ class EegmFrame:
         epoch_seq: int,
         channels: list[list[float]],
         n_samples: int | None = None,
+        timestamp_us: int = 0,
     ) -> "EegmFrame":
         """Build a frame from per-channel sample lists."""
         n_ch = len(channels)
@@ -118,6 +121,7 @@ class EegmFrame:
             epoch_seq=epoch_seq,
             n_channels=n_ch,
             n_samples=n_samples,
+            timestamp_us=timestamp_us,
             data=data,
         )
 
@@ -130,6 +134,7 @@ class EegmFrame:
             self.epoch_seq,
             self.n_channels,
             self.n_samples,
+            self.timestamp_us,
         )
         payload = struct.pack(f"<{len(self.data)}f", *self.data)
         return header + payload
@@ -177,8 +182,8 @@ async def read_message(reader) -> ConnectReq | ConnectAck | EegmFrame | None:
 
     elif magic == MAGIC_EEGM:
         hdr_rest = await reader.readexactly(HEADER_SIZE - 4)
-        headband_id, epoch_seq, n_channels, n_samples = struct.unpack(
-            "<4I", hdr_rest
+        headband_id, epoch_seq, n_channels, n_samples, timestamp_us = struct.unpack(
+            "<4IQ", hdr_rest
         )
         if n_channels > 64 or n_samples > 65536:
             raise IOError(
@@ -192,6 +197,7 @@ async def read_message(reader) -> ConnectReq | ConnectAck | EegmFrame | None:
             epoch_seq=epoch_seq,
             n_channels=n_channels,
             n_samples=n_samples,
+            timestamp_us=timestamp_us,
             data=data,
         )
 
