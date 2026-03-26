@@ -117,6 +117,8 @@ class MmapJobQueue:
         """Dequeue an item.  Blocks up to *timeout* seconds."""
         with self._not_empty:
             while True:
+                if self._mm.closed:
+                    raise queue.Empty
                 _, tail, count = _RING_HDR.unpack_from(self._mm, 0)
                 if count > 0:
                     break

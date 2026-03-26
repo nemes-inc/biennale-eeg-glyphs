@@ -418,6 +418,10 @@ class InferenceServer:
                 self._job_queue.put_nowait(None)
             except queue.Full:
                 pass
+        # Wait for workers to drain before closing the mmap
+        for t in self._worker_threads:
+            t.join(timeout=5.0)
+        self._worker_threads.clear()
         # Clean up the mmap backing file
         self._job_queue.close()
         # Shut down the persistent inference subprocess
