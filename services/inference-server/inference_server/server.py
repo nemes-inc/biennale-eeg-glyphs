@@ -102,6 +102,7 @@ class InferenceServer:
 
     async def start(self) -> None:
         """Start the TCP server and worker pool."""
+        self._loop = asyncio.get_running_loop()
         if not self.echo_mode:
             self._start_worker_pool()
             log.info(
@@ -332,7 +333,7 @@ class InferenceServer:
                     self._workers_ready.set()
 
         wlog.info("Worker %d ready.", worker_id)
-        loop = asyncio.get_event_loop()
+        loop = self._loop
 
         while self._running:
             try:

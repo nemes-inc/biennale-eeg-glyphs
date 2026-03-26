@@ -22,7 +22,10 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +41,9 @@ EPOCH_SECONDS = 5
 
 # Muse 4-channel names matching standard_1020
 MUSE_CHANNEL_NAMES = ["TP9", "AF7", "AF8", "TP10"]
+
+# Serialize inference() calls so workers don't race on MASTER_PORT / GPU.
+_inference_lock = threading.Lock()
 
 
 def _pick_free_port() -> int:
@@ -126,7 +132,8 @@ class ZunaWorker:
         self, job: InferenceJob, work: Path
     ) -> InferenceResult | None:
         import mne
-        from zuna import inference, preprocessing, pt_to_fif
+        import zuna
+        from zuna import preprocessing, pt_to_fif
 
         epoch = job.epoch
         n_ch = epoch.n_channels
@@ -169,21 +176,21 @@ class ZunaWorker:
         )
 
         # ── 3. Inference ──────────────────────────────────────────────────
-        # Avoid torch.distributed port collisions
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ["MASTER_PORT"] = str(_pick_free_port())
+        # Guard: skip if preprocessing produced no .pt files
+        pt_files = list(pt_in.glob("*.pt"))
+        if not pt_files:
+            log.warning(
+                "Preprocessing produced 0 .pt files for headband=%d seq=%d — skipping inference",
+                job.headband_id,
+                epoch.seq,
+            )
+            return None
 
-        inference(
-            input_dir=str(pt_in),
-            output_dir=str(pt_out),
-            gpu_device=self.gpu_device,
-            tokens_per_batch=self.tokens_per_batch,
-            data_norm=10.0,
-            diffusion_cfg=1.0,
-            diffusion_sample_steps=self.diffusion_steps,
-            plot_eeg_signal_samples=False,
-            inference_figures_dir=str(work / "FIGURES"),
-        )
+        # Serialize: workers share os.environ and a single GPU.
+        with _inference_lock:
+            self._run_inference_subprocess(
+                pt_in=pt_in, pt_out=pt_out, work=work, zuna_pkg=zuna,
+            )
 
         # ── 4. Reconstruct .pt → .fif ────────────────────────────────────
         pt_to_fif(input_dir=str(pt_out), output_dir=str(fif_out))
@@ -209,3 +216,50 @@ class ZunaWorker:
             n_samples=out_n_samples,
             channels=out_channels,
         )
+
+    def _run_inference_subprocess(
+        self,
+        pt_in: Path,
+        pt_out: Path,
+        work: Path,
+        zuna_pkg,
+    ) -> None:
+        """Run ZUNA inference via our shim to work around hardcoded MASTER_PORT.
+
+        Instead of calling ``zuna.inference()`` (which spawns a subprocess
+        that hits a hardcoded port in lingua), we build the same command but
+        route it through ``_inference_shim.py``.  The shim monkey-patches
+        ``torch.distributed.init_process_group`` to use our chosen port.
+        """
+        zuna_root = Path(zuna_pkg.__file__).parent
+        eeg_eval_script = (
+            zuna_root / "inference/AY2l/lingua/apps/AY2latent_bci/eeg_eval.py"
+        )
+        config_path = (
+            zuna_root / "inference/AY2l/lingua/apps/AY2latent_bci/configs/config_infer.yaml"
+        )
+        shim_script = Path(__file__).parent / "_inference_shim.py"
+
+        pt_out.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            sys.executable,
+            str(shim_script),
+            str(eeg_eval_script),
+            f"config={config_path}",
+            f"data.data_dir={pt_in.absolute()}",
+            f"data.export_dir={pt_out.absolute()}",
+            f"diffusion_cfg=1.0",
+            f"diffusion_sample_steps={self.diffusion_steps}",
+            f"plot_eeg_signal_samples=False",
+            f"inference_figures_dir={work / 'FIGURES'}",
+            f"data.target_packed_seqlen={self.tokens_per_batch}",
+            f"data.data_norm=10.0",
+        ]
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_device)
+        env["MASTER_ADDR"] = "127.0.0.1"
+        env["_INFERENCE_MASTER_PORT"] = str(_pick_free_port())
+
+        subprocess.run(cmd, env=env, check=True)
