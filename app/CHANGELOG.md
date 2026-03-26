@@ -1,3 +1,21 @@
+# v0.2.0
+
+## March 26, 2026
+
+## Multi-Muse EEG Viewer
+
+The old viewer talked to exactly one Muse. Running a multi-headband installation meant running multiple viewer processes and praying they didn't fight over CoreBluetooth. Now the viewer supports up to 4 simultaneous Muse headsets through a single shared tokio runtime. Each device gets its own BLE task, its own tab, and its own recording session. The scan-then-pick flow uses the muse-rs `scan_all()` + `connect_to(device)` API so each connection reuses the adapter handle from discovery instead of spawning a fresh CBCentralManager.
+
+Streaming to the inference server used to be fire-and-forget over TCP. If the Python server crashed mid-session you lost every frame in flight and had no way to replay. The BLE loop now writes each EEGM frame to a per-device session file on disk before pushing it to the TCP channel. A `frames_sent` counter per device tracks what actually made it to the server. When you reconnect, the TCP client reads each session file from the last-sent offset and replays the gap automatically. No user interaction required, no data lost. Session files are just concatenated EEGM binary frames so they're self-describing and trivially replayable.
+
+The bottom status bar was missing entirely. You had no idea whether the server was connected, how many frames were flowing, or if anything was stuck. Now the bar shows server connection state, local frames processed, frames written to disk, frames sent to server, and a yellow pending count when the two diverge. Boring but essential.
+
+Per-device recording was a natural consequence of the multi-device split. Each tab has its own Record/Stop button, its own accumulation buffer, and its own FIF output path with the device name baked in for disambiguation. The ZUNA pipeline preprocess button works per-tab too.
+
+Legacy stdin and TCP pipe modes still work unchanged with --stdin or --tcp.
+
+---
+
 # v0.1.0
 
 First feature-complete release of `muse-rs` — an async Rust library and terminal UI for streaming real-time sensor data from Interaxon Muse EEG headsets over Bluetooth Low Energy.

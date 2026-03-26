@@ -16,6 +16,9 @@
 *.db-shm
 *.db-wal
 
+# Agents
+.claude/
+
 # Binaries
 
 # Misc

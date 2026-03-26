@@ -13,6 +13,10 @@
       "path": "services/zuna"
     },
     {
+      "name": "inference",
+      "path": "services/inference-server"
+    },
+    {
       "name": "muse-rs",
       "path": "app"
     },
