@@ -61,6 +61,7 @@ from apps.AY2latent_bci.eeg_data import (
     BCIDatasetArgs,
     EEGProcessor,
     create_dataloader_v2,
+    invert_reshape_signals,
 )
 from apps.AY2latent_bci.transformer import (
     DecoderTransformerArgs,
@@ -145,7 +146,12 @@ def _check_and_save_complete(accumulator, export_dir) -> list[str]:
 # ── Unwrap signals (simplified from eeg_eval.py) ────────────────────────
 
 def _unwrap_signals(model_output, batch, args):
-    """Unwrap variable-length packed sequences into per-sample arrays."""
+    """Unwrap variable-length packed sequences into per-sample 2-D arrays.
+
+    Uses ``invert_reshape_signals`` so the coarse-time interleaving
+    introduced by ``chop_and_reshape_signals`` is properly reversed,
+    yielding arrays of shape ``(num_chans, num_tpts)`` — e.g. ``(4, 1280)``.
+    """
     model_input = batch["encoder_input"]
     eeg_signal = batch["eeg_signal"]
     seq_lens = batch["seq_lens"].cpu().numpy()
@@ -165,19 +171,32 @@ def _unwrap_signals(model_output, batch, args):
         sl = slice(seqlen_accum, seqlen_accum + seqlen)
 
         if args.data.cat_chan_xyz_and_eeg:
-            sig_in = model_input[sl, 3:]
             eeg_s = eeg_signal[sl, 3:]
             sig_out = model_output.squeeze(0)[sl, 3:]
             pos_in = model_input[sl, :3]
         else:
-            sig_in = model_input[sl, :]
             eeg_s = eeg_signal[sl, :]
             sig_out = model_output.squeeze(0)[sl, :]
             pos_in = batch["chan_pos"][sl, :]
 
-        out_sig.append(sig_out.reshape(num_chans, tc, -1).cpu().numpy())
-        out_orig.append(eeg_s.reshape(num_chans, tc, -1).cpu().numpy())
-        out_pos.append(pos_in.reshape(num_chans, tc, -1).cpu().numpy())
+        # invert_reshape_signals expects (seqlen, tf) and returns (num_chans, num_tpts)
+        sig_out_2d, _, _, _, _ = invert_reshape_signals(
+            sig_reshaped=sig_out,
+            num_chans=num_chans,
+            tf=tf,
+            use_coarse_time=args.data.use_coarse_time,
+        )
+        eeg_s_2d, _, _, _, _ = invert_reshape_signals(
+            sig_reshaped=eeg_s,
+            num_chans=num_chans,
+            tf=tf,
+            use_coarse_time=args.data.use_coarse_time,
+        )
+
+        out_sig.append(sig_out_2d.cpu().numpy())
+        out_orig.append(eeg_s_2d.cpu().numpy())
+        # Position: take first coarse-time step per channel → (num_chans, 3)
+        out_pos.append(pos_in.reshape(num_chans, tc, -1)[:, 0, :].cpu().numpy())
         seqlen_accum += seqlen
 
     return out_sig, out_orig, out_pos
