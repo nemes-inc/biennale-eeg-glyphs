@@ -191,7 +191,7 @@ class InferenceServer:
                 channels = [
                     frame.channel_data(ch) for ch in range(frame.n_channels)
                 ]
-                self.buffers[hid].push(channels)
+                self.buffers[hid].push(channels, frame.timestamp_us)
 
                 # Check for complete epochs
                 while True:
@@ -298,6 +298,7 @@ class InferenceServer:
                 epoch_seq=result.epoch_seq,
                 channels=result.channels,
                 n_samples=result.n_samples,
+                timestamp_us=result.timestamp_us,
             )
             try:
                 await write_frame(writer, frame)
