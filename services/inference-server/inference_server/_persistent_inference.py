@@ -269,6 +269,9 @@ def _run_epoch(
         batch_filenames = batch.pop("filename", None)
         batch_sample_indices = batch.pop("sample_idx", None)
         batch_metadata_list = batch.pop("metadata", None)
+        # The raw dataloader uses 'ids'; eeg_eval's wrapper renames to 'idx'.
+        # Pop both to be safe, plus dataset_id — none are used by EEGProcessor.
+        batch.pop("ids", None)
         batch.pop("idx", None)
         batch.pop("dataset_id", None)
 
