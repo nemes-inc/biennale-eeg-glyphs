@@ -17,6 +17,7 @@ Matches the Rust implementation in ``muse_rs::eegm``.
 
 from __future__ import annotations
 
+import asyncio
 import struct
 from dataclasses import dataclass, field
 
@@ -151,11 +152,12 @@ async def read_message(reader) -> ConnectReq | ConnectAck | EegmFrame | None:
     Dispatches on the magic bytes (EEGC for control, EEGM for data).
     Returns ``None`` on clean EOF.
     """
-    magic_bytes = await reader.read(4)
-    if len(magic_bytes) == 0:
-        return None
-    if len(magic_bytes) < 4:
-        raise IOError(f"truncated magic ({len(magic_bytes)} bytes)")
+    try:
+        magic_bytes = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as e:
+        if len(e.partial) == 0:
+            return None
+        raise IOError(f"truncated magic ({len(e.partial)} bytes)") from e
 
     (magic,) = struct.unpack("<I", magic_bytes)
 

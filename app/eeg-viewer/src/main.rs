@@ -923,11 +923,7 @@ impl EegViewerApp {
                                 .show(ui, |plot_ui| {
                                     if self.show_raw {
                                         let ch = &raw_snapshot[i];
-                                        let pts: PlotPoints = ch
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(t, &v)| [t as f64, v as f64])
-                                            .collect();
+                                        let pts: PlotPoints = ch.iter().copied().collect();
                                         plot_ui.line(
                                             Line::new(pts)
                                                 .name("Raw")
@@ -937,11 +933,7 @@ impl EegViewerApp {
 
                                     if has_recon && self.show_reconstructed {
                                         let ch = &recon_snapshot[i];
-                                        let pts: PlotPoints = ch
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(t, &v)| [t as f64, v as f64])
-                                            .collect();
+                                        let pts: PlotPoints = ch.iter().copied().collect();
                                         plot_ui.line(
                                             Line::new(pts)
                                                 .name("Reconstructed")

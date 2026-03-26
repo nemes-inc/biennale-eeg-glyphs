@@ -31,17 +31,19 @@ class EpochBuffer:
     n_channels: int = NUM_MUSE_CHANNELS
     # Per-channel ring buffer (list of lists).
     _buffers: list[list[float]] = field(default_factory=list)
-    # How many samples have been consumed (for hop tracking).
-    _consumed: int = 0
     # Monotonic epoch counter.
     _epoch_seq: int = 0
+    # Timestamp of the first frame contributing to the current window.
+    _window_start_ts: int = 0
 
     def __post_init__(self) -> None:
         if not self._buffers:
             self._buffers = [[] for _ in range(self.n_channels)]
 
-    def push(self, channels: list[list[float]]) -> None:
+    def push(self, channels: list[list[float]], timestamp_us: int = 0) -> None:
         """Append samples from an EEGM frame (channel-major lists)."""
+        if self.available() == 0 and timestamp_us > 0:
+            self._window_start_ts = timestamp_us
         for ch_idx, samples in enumerate(channels):
             if ch_idx < self.n_channels:
                 self._buffers[ch_idx].extend(samples)
@@ -59,18 +61,23 @@ class EpochBuffer:
 
         channels = [b[:EPOCH_SAMPLES] for b in self._buffers]
         seq = self._epoch_seq
+        ts = self._window_start_ts
         self._epoch_seq += 1
 
         # Advance by hop (discard consumed samples).
         for b in self._buffers:
             del b[:HOP_SAMPLES]
 
-        return Epoch(seq=seq, channels=channels)
+        # Next window starts HOP_SAMPLES later
+        if ts > 0:
+            hop_us = int(HOP_SAMPLES / SAMPLE_RATE * 1_000_000)
+            self._window_start_ts = ts + hop_us
+
+        return Epoch(seq=seq, channels=channels, timestamp_us=ts)
 
     def clear(self) -> None:
         """Reset all buffers."""
         self._buffers = [[] for _ in range(self.n_channels)]
-        self._consumed = 0
 
 
 @dataclass
@@ -79,6 +86,7 @@ class Epoch:
 
     seq: int
     channels: list[list[float]]  # [n_channels][EPOCH_SAMPLES]
+    timestamp_us: int = 0  # timestamp of the first sample in this epoch
 
     @property
     def n_channels(self) -> int:

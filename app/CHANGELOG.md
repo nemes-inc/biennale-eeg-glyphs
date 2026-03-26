@@ -2,6 +2,10 @@
 
 ## March 26, 2026
 
+## Timestamp-aligned inference overlay
+
+Reconstructed EEG from the inference server used to just get appended to the end of the plot buffer — so if ZUNA took 30 seconds to process an epoch, the red overlay would show up 30 seconds to the right of where the original data was. Useless for visual comparison. The EEGM wire format now carries a `timestamp_us` field (u64, microseconds) in every frame header, bumping it from 20 to 28 bytes. The Rust BLE loop stamps each outgoing frame with `SystemTime::now()`. The Python server threads that timestamp through the epoch buffer (advancing by hop duration on each 50% overlap), through ZUNA inference, and back out in the response frame. The viewer stores plot data as `[f64; 2]` (time_seconds, amplitude) instead of plain `f32`, computes relative time from the first frame's timestamp, and places reconstructed data at the exact x-position where it was originally captured. If the server sends `timestamp_us=0` (old server, echo mode), the viewer falls back to placing data at the current end of the raw timeline.
+
 ## Multi-Muse EEG Viewer
 
 The old viewer talked to exactly one Muse. Running a multi-headband installation meant running multiple viewer processes and praying they didn't fight over CoreBluetooth. Now the viewer supports up to 4 simultaneous Muse headsets through a single shared tokio runtime. Each device gets its own BLE task, its own tab, and its own recording session. The scan-then-pick flow uses the muse-rs `scan_all()` + `connect_to(device)` API so each connection reuses the adapter handle from discovery instead of spawning a fresh CBCentralManager.

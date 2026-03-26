@@ -195,8 +195,9 @@ pub fn spawn_tcp_client(
                         }
                         let map = device_map_recv.lock().unwrap();
                         if let Some(state) = map.get(&frame.headband_id) {
+                            let ts = frame.timestamp_us;
                             let channels = extract_channels_from_frame(&frame);
-                            state.lock().unwrap().push_reconstructed_frame(channels);
+                            state.lock().unwrap().push_reconstructed_frame(channels, ts);
                         } else if recv_count <= 5 {
                             warn!(
                                 "No device for headband_id={}, known ids: {:?}",
@@ -313,6 +314,10 @@ async fn read_eegm_message<R: AsyncReadExt + Unpin>(
                     u32::from_le_bytes([hdr_rest[8], hdr_rest[9], hdr_rest[10], hdr_rest[11]]);
                 let n_samples =
                     u32::from_le_bytes([hdr_rest[12], hdr_rest[13], hdr_rest[14], hdr_rest[15]]);
+                let timestamp_us = u64::from_le_bytes([
+                    hdr_rest[16], hdr_rest[17], hdr_rest[18], hdr_rest[19],
+                    hdr_rest[20], hdr_rest[21], hdr_rest[22], hdr_rest[23],
+                ]);
 
                 let payload_len = (n_channels as usize) * (n_samples as usize);
                 let mut raw = vec![0u8; payload_len * 4];
@@ -328,6 +333,7 @@ async fn read_eegm_message<R: AsyncReadExt + Unpin>(
                     epoch_seq,
                     n_channels,
                     n_samples,
+                    timestamp_us,
                     data,
                 }));
             }

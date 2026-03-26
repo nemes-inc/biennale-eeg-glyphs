@@ -67,6 +67,7 @@ class InferenceResult:
     n_channels: int
     n_samples: int
     channels: list[list[float]]  # [n_channels][n_samples]
+    timestamp_us: int = 0  # original capture timestamp from the source epoch
 
 
 @dataclass
@@ -230,6 +231,7 @@ class ZunaWorker:
             n_channels=recon_data.shape[0],
             n_samples=out_n_samples,
             channels=out_channels,
+            timestamp_us=epoch.timestamp_us,
         )
 
 
