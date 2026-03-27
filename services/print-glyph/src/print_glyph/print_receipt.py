@@ -134,9 +134,9 @@ def scale_wave_auto_center(wave_img, target_w, target_h):
 
 def draw_vesica(filled_center=True):
   """Two overlapping circles — porous fills the intersection, boundaried fills the outer."""
-  img = Image.new("L", (W, 130), BG)
+  img = Image.new("L", (W, 120), BG)
   draw = ImageDraw.Draw(img)
-  cx, cy, r, offset = W // 2, 65, 48, 26
+  cx, cy, r, offset = W // 2, 60, 48, 26
   lx, rx = cx - offset, cx + offset
 
   if filled_center:
@@ -307,43 +307,28 @@ def witnessed_glyph(result):
 # ---------------------------------------------------------------------------
 
 
-def build_receipt(absorption, attunement, unknown, witnessed):
+def build_receipt(absorption=None, attunement=None, unknown=None, witnessed=None):
   parts = [spacer(16), hline(2), hline_light(), spacer(10)]
 
-  # Absorption
-  # parts.append(dim_label("A B S O R P T I O N"))
-  parts.append(spacer(6))
-  parts += absorption_glyph(absorption)
-  parts.append(result_label("A B S O R P T I O N"))
-  parts += [spacer(10), hline_light(), hline(2), spacer(10)]
-
-  # Attunement
-  # parts.append(dim_label("A T T U N E M E N T"))
-  parts.append(spacer(6))
-  parts += attunement_glyph(attunement)
-  parts.append(result_label("A T T U N E M E N T"))
-  parts += [spacer(10), hline_light(), hline(2), spacer(10)]
-
-  # The Unknown
-  # parts.append(dim_label("T H E   U N K N O W N"))
-  parts.append(spacer(6))
-  parts += unknown_glyph(unknown)
-  parts.append(result_label("T H E   U N K N O W N"))
-  parts += [spacer(10), hline_light(), hline(2), spacer(10)]
-
-  # Being Witnessed
-  # parts.append(dim_label("B E I N G   W I T N E S S E D"))
-  parts.append(spacer(6))
-  parts += witnessed_glyph(witnessed)
-  parts.append(result_label("W I T N E S S E D"))
-  parts += [spacer(10), hline_light(), hline(2), spacer(12)]
+  dims = [
+    (absorption, absorption_glyph, "A B S O R P T I O N"),
+    (attunement, attunement_glyph, "A T T U N E M E N T"),
+    (unknown, unknown_glyph, "T H E   U N K N O W N"),
+    (witnessed, witnessed_glyph, "W I T N E S S E D"),
+  ]
+  included = [(val, fn, lbl) for val, fn, lbl in dims if val is not None]
+  for i, (val, glyph_fn, label_text) in enumerate(included):
+    parts.append(spacer(6))
+    parts += glyph_fn(val)
+    parts.append(result_label(label_text))
+    parts += [spacer(10), hline_light(), hline(2), spacer(10 if i < len(included) - 1 else 12)]
 
   # Footer
   parts.append(spacer(20))
   parts.append(label_img("MAGIC CARPET RIDE", size=20, color=40))
   parts.append(label_img("BOMBAY BEACH BIENNALE", size=20, color=40))
-  parts.append(spacer(6))
-  parts.append(label_img("SYNCOPY DESIGN LAB", size=20, color=40))
+  # parts.append(spacer(6))
+  # parts.append(label_img("SYNCOPY DESIGN LAB", size=20, color=40))
   parts.append(spacer(100))
 
   # Stitch all parts vertically
@@ -361,21 +346,30 @@ def build_receipt(absorption, attunement, unknown, witnessed):
 # ---------------------------------------------------------------------------
 
 
-def print_receipt(absorption, attunement, unknown, witnessed, save_preview=True):
+def print_receipt(absorption=None, attunement=None, unknown=None, witnessed=None, save_preview=True):
   valid = {
     "absorption": ["deep", "surface"],
     "attunement": ["porous", "boundaried"],
     "unknown": ["lean_in", "hold_back"],
     "witnessed": ["approach", "withdraw"],
   }
-  values = [absorption, attunement, unknown, witnessed]
-  for key, val in zip(valid.keys(), values):
-    if val not in valid[key]:
+  provided = {
+    "absorption": absorption,
+    "attunement": attunement,
+    "unknown": unknown,
+    "witnessed": witnessed,
+  }
+  for key, val in provided.items():
+    if val is not None and val not in valid[key]:
       print(f"ERROR: Invalid value '{val}' for {key}. Must be one of: {valid[key]}")
       sys.exit(1)
+  if all(v is None for v in provided.values()):
+    print("ERROR: At least one dimension must be specified.")
+    sys.exit(1)
 
-  print(f"Building receipt: {absorption} / {attunement} / {unknown} / {witnessed}")
-  receipt = build_receipt(absorption, attunement, unknown, witnessed)
+  desc = " / ".join(f"{v}" for v in provided.values() if v is not None)
+  print(f"Building receipt: {desc}")
+  receipt = build_receipt(**provided)
 
   if save_preview:
     path = os.path.join(DIR, "receipt_preview.png")
@@ -410,10 +404,10 @@ def print_receipt(absorption, attunement, unknown, witnessed, save_preview=True)
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="Print a Magic Carpet Ride glyph receipt.")
-  parser.add_argument("--absorption", required=True, choices=["deep", "surface"])
-  parser.add_argument("--attunement", required=True, choices=["porous", "boundaried"])
-  parser.add_argument("--unknown", required=True, choices=["lean_in", "hold_back"])
-  parser.add_argument("--witnessed", required=True, choices=["approach", "withdraw"])
+  parser.add_argument("--absorption", choices=["deep", "surface"], default=None)
+  parser.add_argument("--attunement", choices=["porous", "boundaried"], default=None)
+  parser.add_argument("--unknown", choices=["lean_in", "hold_back"], default=None)
+  parser.add_argument("--witnessed", choices=["approach", "withdraw"], default=None)
   parser.add_argument(
     "--preview-only",
     action="store_true",
@@ -421,10 +415,19 @@ if __name__ == "__main__":
   )
   args = parser.parse_args()
 
+  dims = {
+    k: v for k, v in
+    {"absorption": args.absorption, "attunement": args.attunement,
+     "unknown": args.unknown, "witnessed": args.witnessed}.items()
+    if v is not None
+  }
+  if not dims:
+    parser.error("At least one dimension must be specified.")
+
   if args.preview_only:
-    receipt = build_receipt(args.absorption, args.attunement, args.unknown, args.witnessed)
+    receipt = build_receipt(**dims)
     path = os.path.join(DIR, "receipt_preview.png")
     receipt.save(path)
     print(f"Preview saved: {path}")
   else:
-    print_receipt(args.absorption, args.attunement, args.unknown, args.witnessed)
+    print_receipt(**dims)
