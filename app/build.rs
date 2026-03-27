@@ -73,13 +73,19 @@ fn main() {
             .cpp(true)
             .std("c++17")
             .opt_level(3)
-            .define("USE_MLX", None)
-            .define("ACCELERATE_NEW_LAPACK", None)
             .include(format!("{act_lib}/include"))
             .include(format!("{act_lib}/lib"))
-            .include("/usr/local/include")
-            .include("/opt/homebrew/include")
             .warnings(false); // suppress ALGLIB sprintf deprecation warnings
+
+        let is_macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
+        if is_macos {
+            build
+                .define("USE_MLX", None)
+                .define("ACCELERATE_NEW_LAPACK", None)
+                .include(format!("{act_lib}/lib/mlx"))
+                .include("/usr/local/include")
+                .include("/opt/homebrew/include");
+        }
 
         for src in &act_sources {
             build.file(src);
@@ -92,15 +98,20 @@ fn main() {
         build.compile("act_bridge");
 
         // Link system libraries
-        println!("cargo:rustc-link-search=native=/usr/local/lib");
-        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
-        println!("cargo:rustc-link-lib=dylib=mlx");
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-        println!("cargo:rustc-link-lib=framework=Metal");
-        println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
-        println!("cargo:rustc-link-lib=framework=Foundation");
-        println!("cargo:rustc-link-lib=framework=QuartzCore");
-        println!("cargo:rustc-link-lib=c++");
+        if is_macos {
+            println!("cargo:rustc-link-search=native=/usr/local/lib");
+            println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+            println!("cargo:rustc-link-lib=dylib=mlx");
+            println!("cargo:rustc-link-lib=framework=Accelerate");
+            println!("cargo:rustc-link-lib=framework=Metal");
+            println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+            println!("cargo:rustc-link-lib=framework=Foundation");
+            println!("cargo:rustc-link-lib=framework=QuartzCore");
+            println!("cargo:rustc-link-lib=c++");
+        } else {
+            println!("cargo:rustc-link-lib=stdc++");
+            println!("cargo:rustc-link-lib=blas");
+        }
 
         // Re-run if bridge files change
         println!("cargo:rerun-if-changed=ffi/act_bridge.h");

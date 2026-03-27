@@ -305,6 +305,26 @@ impl MuseClient {
         &self,
         device: MuseDevice,
     ) -> Result<(mpsc::Receiver<MuseEvent>, MuseHandle)> {
+        // On Linux, BlueZ may garbage-collect the D-Bus device object after
+        // the original scan ends.  A brief re-scan on the same adapter
+        // repopulates the cache so that peripheral.connect() finds a valid
+        // org.bluez.Device1 path.  We also pause after stopping so the HCI
+        // controller is idle before the connection attempt.
+        #[cfg(target_os = "linux")]
+        {
+            info!("Linux: refreshing BlueZ device cache before connect…");
+            if let Err(e) = device.adapter.start_scan(ScanFilter::default()).await {
+                warn!("Linux: pre-connect scan start failed: {e}");
+            } else {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = device.adapter.stop_scan().await;
+                // Let the HCI controller settle after scan stops — connecting
+                // while the controller is still transitioning causes
+                // le-connection-abort-by-local on many adapters.
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+        }
+
         self.setup_peripheral(device.peripheral, device.name, device.adapter)
             .await
     }
@@ -372,6 +392,37 @@ impl MuseClient {
         // Hard timeout on connect(): BlueZ's org.bluez.Device1.Connect can block
         // forever when the device is out of range or the stack is in a bad state.
         // Ten seconds is generous for a BLE connection that typically takes <2 s.
+        //
+        // On Linux, BLE connections are flaky — transient errors like
+        // le-connection-abort-by-local are common.  Retry up to 3 times with
+        // increasing back-off before giving up.
+        #[cfg(target_os = "linux")]
+        {
+            let mut last_err: Option<anyhow::Error> = None;
+            let delays = [1000u64, 2000, 3000];
+            for (attempt, backoff_ms) in delays.iter().enumerate() {
+                info!("Linux: connect attempt {}/{}", attempt + 1, delays.len());
+                match tokio::time::timeout(Duration::from_secs(10), peripheral.connect()).await {
+                    Ok(Ok(())) => {
+                        last_err = None;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Linux: connect attempt {} failed: {e}", attempt + 1);
+                        last_err = Some(e.into());
+                    }
+                    Err(_) => {
+                        warn!("Linux: connect attempt {} timed out", attempt + 1);
+                        last_err = Some(anyhow!("BLE connect() timed out after 10 s"));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+            }
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         tokio::time::timeout(Duration::from_secs(10), peripheral.connect())
             .await
             .map_err(|_| anyhow!("BLE connect() timed out after 10 s"))??;
