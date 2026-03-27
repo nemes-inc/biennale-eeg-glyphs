@@ -10,6 +10,8 @@ use std::sync::Arc;
 use muse_rs::eegm::{EegmFrame, HEADER_SIZE};
 use tokio::sync::mpsc;
 
+use crate::signal_pipeline::{AnalysisFrame, PipelineCommand};
+
 /// Channel for sending EEGM frames to the inference server.
 pub type OutboundTx = mpsc::UnboundedSender<EegmFrame>;
 pub type OutboundRx = mpsc::UnboundedReceiver<EegmFrame>;
@@ -101,6 +103,9 @@ pub struct DeviceState {
     stream_start_us: Option<u64>,
 
     max_points: usize,
+
+    /// Dimension analysis snapshot, written by BLE pipeline, read by UI.
+    pub analysis: AnalysisFrame,
 }
 
 impl DeviceState {
@@ -121,6 +126,7 @@ impl DeviceState {
             session_frames_sent: 0,
             stream_start_us: None,
             max_points,
+            analysis: AnalysisFrame::default(),
         }
     }
 
@@ -361,6 +367,8 @@ pub struct ConnectedDevice {
     pub epoch_seq: u32,
     /// Path to the session file for write-ahead logging.
     pub session_path: Option<PathBuf>,
+    /// Send dimension analysis commands to the BLE pipeline.
+    pub pipeline_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<PipelineCommand>>,
 }
 
 // ── Semantic functions (pure, testable) ──────────────────────────────────────
@@ -752,6 +760,7 @@ mod tests {
             last_record_toggle: None,
             epoch_seq: 0,
             session_path: None,
+            pipeline_cmd_tx: None,
         }
     }
 

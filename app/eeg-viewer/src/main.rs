@@ -8,7 +8,10 @@
 
 mod device_state;
 mod muse_ble;
+mod signal_pipeline;
 mod tcp_client;
+mod viz_aura;
+mod viz_topo;
 
 use std::collections::HashSet;
 use std::fs;
@@ -32,6 +35,9 @@ use device_state::{
     ConnectedDevice, DeviceState, ServerState, SharedOutboundTx,
 };
 use muse_ble::ScanResult;
+use signal_pipeline::{
+    AnalysisFrame, BaselineState, DimensionReading, PipelineCommand, VizMode,
+};
 use tcp_client::DeviceMap;
 
 const MAGIC_SINGLE: u32 = 0x4545_4746; // "EEGF"
@@ -113,6 +119,10 @@ struct Args {
         default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/muse-record-fif")
     )]
     muse_record_bin: PathBuf,
+
+    /// Launch with a simulated Muse device (synthetic EEG, no BLE needed).
+    #[arg(long)]
+    simulate: bool,
 }
 
 /// Job events from background Record / Preprocess threads.
@@ -158,6 +168,7 @@ struct EegViewerApp {
     show_live: bool,
     show_raw: bool,
     show_reconstructed: bool,
+    viz_mode: VizMode,
 
     // ── Recording / ZUNA ──
     zuna_dir: PathBuf,
@@ -273,12 +284,15 @@ impl EegViewerApp {
         let sr = self.scan_results.remove(scan_idx);
         let sess_path = session_file_path(&self.zuna_dir, &display_label);
 
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let ble_handle = muse_ble::spawn_device_ble_task(
             sr.device,
             headband_id,
             Arc::clone(&state),
             self.outbound_tx.clone(),
             Some(sess_path.clone()),
+            cmd_rx,
             &self.tokio_rt,
         );
 
@@ -300,6 +314,7 @@ impl EegViewerApp {
             last_record_toggle: None,
             epoch_seq: 0,
             session_path: Some(sess_path),
+            pipeline_cmd_tx: Some(cmd_tx),
         });
 
         self.active_tab = self.connected_devices.len() - 1;
@@ -316,6 +331,116 @@ impl EegViewerApp {
             .unwrap()
             .remove(&device.headband_id.as_u32());
         self.active_tab = clamp_tab_index(self.active_tab, self.connected_devices.len());
+    }
+
+    /// Spawn a simulated device that generates synthetic EEG data.
+    fn spawn_simulated_device(&mut self) {
+        use std::sync::atomic::AtomicBool;
+        use device_state::HeadbandId;
+        use signal_pipeline::{ChannelId, SignalPipeline};
+
+        let headband_id = HeadbandId::new(0).unwrap();
+        let state = Arc::new(Mutex::new(DeviceState::new(
+            "Simulated".to_string(),
+            "sim-0000".to_string(),
+            self.max_points,
+        )));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let state_clone = Arc::clone(&state);
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let join = self.tokio_rt.spawn(async move {
+            let mut pipeline = SignalPipeline::new();
+            let mut t: f64 = 0.0;
+            let dt = 1.0 / 256.0;
+            let samples_per_packet = 12; // Muse sends 12 samples per BLE packet
+
+            loop {
+                if stop_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Drain any pending commands
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    if let Err(reason) = pipeline.execute_command(cmd) {
+                        log::warn!("Sim pipeline command rejected: {reason}");
+                    }
+                }
+
+                // Generate synthetic EEG: 10 Hz alpha with per-channel
+                // amplitude modulation so electrode dots visibly differ.
+                // Each channel has a slow envelope (0.05-0.15 Hz) that makes
+                // alpha power wax and wane independently.
+                let mut frame: Vec<Vec<f32>> = Vec::with_capacity(4);
+                let ch_envelope_freq = [0.07, 0.11, 0.13, 0.05]; // Hz
+                let ch_base_amp = [15.0, 25.0, 20.0, 30.0]; // µV
+                for ch_idx in 0..4usize {
+                    let samples: Vec<f64> = (0..samples_per_packet)
+                        .map(|i| {
+                            let ti = t + i as f64 * dt;
+                            // Slow envelope modulates alpha amplitude per channel
+                            let envelope = 0.3 + 0.7
+                                * (2.0 * std::f64::consts::PI * ch_envelope_freq[ch_idx] * ti)
+                                    .sin()
+                                    .abs();
+                            let alpha = ch_base_amp[ch_idx] * envelope
+                                * (2.0 * std::f64::consts::PI * 10.0 * ti).sin();
+                            let noise = 3.0
+                                * (2.0 * std::f64::consts::PI * 47.3 * ti + ch_idx as f64).sin();
+                            alpha + noise
+                        })
+                        .collect();
+
+                    if let Some(ch) = ChannelId::new(ch_idx) {
+                        pipeline.ingest_samples(ch, &samples);
+                        if ch == ChannelId::TP9 {
+                            if let Some(analysis) = pipeline.try_analyze() {
+                                state_clone.lock().unwrap().analysis = analysis;
+                            }
+                        }
+                    }
+
+                    frame.push(samples.iter().map(|&s| s as f32).collect());
+                }
+
+                // Feed the waveform display via push_raw_frame
+                let timestamp_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as u64)
+                    .unwrap_or(0);
+                state_clone.lock().unwrap().push_raw_frame(frame, timestamp_us);
+
+                t += samples_per_packet as f64 * dt;
+
+                // ~256 Hz: 12 samples every ~47ms
+                tokio::time::sleep(Duration::from_millis(47)).await;
+            }
+        });
+
+        {
+            let mut st = state.lock().unwrap();
+            st.status_line = "Simulated".to_string();
+            st.streaming = true;
+        }
+
+        self.connected_devices.push(ConnectedDevice {
+            device_name: "Simulated Muse".to_string(),
+            device_id: "sim-0000".to_string(),
+            headband_id,
+            state,
+            stop_flag: stop,
+            join_handle: Some(join),
+            last_saved_fif: None,
+            record_started_at: None,
+            last_record_toggle: None,
+            epoch_seq: 0,
+            session_path: None,
+            pipeline_cmd_tx: Some(cmd_tx),
+        });
+
+        self.active_tab = 0;
     }
 
     fn connect_to_server(&mut self) {
@@ -767,6 +892,12 @@ impl EegViewerApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.show_raw, "Raw (blue)");
                 ui.checkbox(&mut self.show_reconstructed, "Reconstructed (red)");
+
+                ui.separator();
+                ui.selectable_value(&mut self.viz_mode, VizMode::Waveforms, "Waveforms");
+                ui.selectable_value(&mut self.viz_mode, VizMode::NeuralAura, "Neural Aura");
+                ui.selectable_value(&mut self.viz_mode, VizMode::BrainTopography, "Brain Topo");
+
                 if self.job_busy {
                     ui.spinner();
                     if let Some(t0) = self.job_started_at {
@@ -776,6 +907,19 @@ impl EegViewerApp {
                     ui.label(format!("last: {}", format_duration(d)));
                 }
             });
+
+            // ── Dimension controls, visible when not in Waveforms mode ──
+            if self.viz_mode != VizMode::Waveforms
+                && self.active_tab < self.connected_devices.len()
+            {
+                let device = &self.connected_devices[self.active_tab];
+                let analysis = device.state.lock().unwrap().analysis.clone();
+                if let Some(ref cmd_tx) = device.pipeline_cmd_tx {
+                    ui.horizontal(|ui| {
+                        render_dimension_controls(ui, &analysis, cmd_tx);
+                    });
+                }
+            }
 
             // ── Job log ──
             if !self.job_log.is_empty() {
@@ -850,6 +994,41 @@ impl EegViewerApp {
                 }
             });
         });
+
+        // ── Neural Aura: right side panel ──
+        if self.viz_mode == VizMode::NeuralAura
+            && self.active_tab < self.connected_devices.len()
+        {
+            let analysis = self.connected_devices[self.active_tab]
+                .state
+                .lock()
+                .unwrap()
+                .analysis
+                .clone();
+            egui::SidePanel::right("neural_aura_panel")
+                .exact_width(280.0)
+                .show(ctx, |ui| {
+                    viz_aura::render_neural_aura(ui, &analysis.dimensions);
+                });
+        }
+
+        // ── Brain Topography: bottom panel ──
+        if self.viz_mode == VizMode::BrainTopography
+            && self.active_tab < self.connected_devices.len()
+        {
+            let analysis = self.connected_devices[self.active_tab]
+                .state
+                .lock()
+                .unwrap()
+                .analysis
+                .clone();
+            egui::TopBottomPanel::bottom("brain_topo_panel")
+                .resizable(true)
+                .default_height(ctx.screen_rect().height() * 0.4)
+                .show(ctx, |ui| {
+                    viz_topo::render_brain_topography(ui, &analysis);
+                });
+        }
 
         // ── Central panel: EEG plot for active device ──
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1150,6 +1329,96 @@ impl EegViewerApp {
 }
 
 // ── Helper functions ────────────────────────────────────────────────────────
+
+fn render_dimension_controls(
+    ui: &mut egui::Ui,
+    analysis: &AnalysisFrame,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<PipelineCommand>,
+) {
+    // Baseline button
+    match analysis.baseline_state() {
+        BaselineState::NotCollected | BaselineState::Failed(_) => {
+            if ui.button("Start Baseline").clicked() {
+                let _ = cmd_tx.send(PipelineCommand::StartBaseline);
+            }
+        }
+        BaselineState::Collecting { progress } => {
+            if ui
+                .button(format!("Stop Baseline ({:.0}%)", progress * 100.0))
+                .clicked()
+            {
+                let _ = cmd_tx.send(PipelineCommand::StopBaseline);
+            }
+        }
+        BaselineState::Collected => {
+            ui.add_enabled(false, egui::Button::new("Baseline done"));
+        }
+    }
+
+    ui.separator();
+
+    // Dimension start/stop buttons
+    let dims: [(
+        &str,
+        &DimensionReading,
+        PipelineCommand,
+        PipelineCommand,
+        bool,
+    ); 4] = [
+        (
+            "Absorption",
+            &analysis.dimensions[0].reading,
+            PipelineCommand::StartAbsorption,
+            PipelineCommand::StopAbsorption,
+            true, // needs baseline
+        ),
+        (
+            "Attunement",
+            &analysis.dimensions[1].reading,
+            PipelineCommand::StartEntrainment,
+            PipelineCommand::StopEntrainment,
+            false,
+        ),
+        (
+            "Unknown",
+            &analysis.dimensions[2].reading,
+            PipelineCommand::StartUnknown,
+            PipelineCommand::StopUnknown,
+            false,
+        ),
+        (
+            "Witnessed",
+            &analysis.dimensions[3].reading,
+            PipelineCommand::StartWitnessed,
+            PipelineCommand::StopWitnessed,
+            false,
+        ),
+    ];
+
+    for (name, reading, start_cmd, stop_cmd, needs_baseline) in &dims {
+        let enabled = !needs_baseline || analysis.baseline_available;
+        match reading {
+            DimensionReading::Idle => {
+                let btn = egui::Button::new(format!("Start {name}"));
+                if ui.add_enabled(enabled, btn).clicked() {
+                    let _ = cmd_tx.send(*start_cmd);
+                }
+            }
+            DimensionReading::Settling { progress }
+            | DimensionReading::Measuring { progress, .. } => {
+                if ui
+                    .button(format!("Stop {name} ({:.0}%)", progress * 100.0))
+                    .clicked()
+                {
+                    let _ = cmd_tx.send(*stop_cmd);
+                }
+            }
+            DimensionReading::Complete(_) => {
+                ui.add_enabled(false, egui::Button::new(format!("{name} done")));
+            }
+        }
+    }
+}
 
 fn format_duration(d: Duration) -> String {
     let total_secs = d.as_secs();
@@ -1472,12 +1741,13 @@ fn main() -> eframe::Result<()> {
     let zuna_dir = args.zuna_dir.clone();
     let muse_record_bin = args.muse_record_bin.clone();
     let server_addr = args.server.clone();
+    let simulate = args.simulate;
 
     eframe::run_native(
         "eeg-viewer",
         options,
         Box::new(move |_cc| {
-            Ok(Box::new(EegViewerApp {
+            let mut app = EegViewerApp {
                 connected_devices: Vec::new(),
                 active_tab: 0,
                 scan_results: Vec::new(),
@@ -1491,6 +1761,7 @@ fn main() -> eframe::Result<()> {
                 show_live: true,
                 show_raw: true,
                 show_reconstructed: true,
+                viz_mode: VizMode::default(),
                 zuna_dir,
                 muse_record_bin,
                 zuna_preset: ZunaPreset::default(),
@@ -1510,7 +1781,11 @@ fn main() -> eframe::Result<()> {
                 muse_status,
                 resume_muse_pending: false,
                 reset_confirm_pending: false,
-            }) as Box<dyn eframe::App>)
+            };
+            if simulate {
+                app.spawn_simulated_device();
+            }
+            Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
 }

@@ -1,6 +1,24 @@
-# v0.2.0
+# v0.3.0
 
 ## March 26, 2026
+
+## Dimension analysis
+
+Four real-time psychological measurements: Absorption, Attunement (ACT entrainment), The Unknown, and Witnessed (frontal asymmetry). A signal pipeline in the BLE task runs bandpass filtering, artifact rejection, and FFT at ~250ms hops, producing typed state-machine snapshots for the UI.
+
+## Two visualization modes
+
+**Neural Aura** — neon arc gauge cards with glow strokes, sparklines, and progress bars in a right sidebar. **Brain Topography** — compile-time-parsed OBJ wireframe head with depth-based alpha, fan-triangulated electrode glow meshes, frontal asymmetry bar, and compact dimension status cards.
+
+## Simulate mode
+
+`--simulate` spawns a fake Muse with per-channel amplitude modulation feeding the real pipeline. Full measurement flow without Bluetooth.
+
+---
+
+# v0.2.0
+
+## March 18, 2026
 
 ## Admin endpoint for remote restart
 

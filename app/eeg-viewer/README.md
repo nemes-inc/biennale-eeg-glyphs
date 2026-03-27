@@ -5,11 +5,14 @@ Multi-Muse EEG viewer with per-device recording and real-time ZUNA inference ove
 ## What it does
 
 - Connects up to 4 Muse headsets over BLE with per-device tabbed waveforms
+- Runs four psychological dimension measurements in real-time (Absorption, Attunement, The Unknown, Witnessed)
+- Two visualization modes: **Neural Aura** (arc gauge cards) and **Brain Topography** (wireframe head map with electrode glow)
 - Records independently per device to FIF files
 - Streams raw EEG to a Python inference server over TCP using the EEGM binary protocol
 - Overlays reconstructed (ZUNA-inferred) EEG at the correct time position on the original trace
 - Every outbound frame is write-ahead logged to a per-device session file before entering the TCP path
 - On server reconnect, replays unsent frames automatically from the session file offset
+- `--simulate` mode for full UI testing without hardware
 - Legacy stdin and TCP pipe modes still work with `--stdin` or `--tcp` flags
 
 ## Timestamp-aligned overlay
@@ -102,7 +105,18 @@ cd app/eeg-viewer
 
 Click Scan to find Muse headsets, click a device to connect, then click Connect Server. The bottom status bar shows frame counters for local processing, disk writes, and server sends. Reconstructed traces overlay in red at the original capture timestamp.
 
-### Test without hardware
+### Simulate mode
+
+The `--simulate` flag spawns a fake Muse device generating synthetic 4-channel EEG at 256 Hz. Each channel has a different alpha amplitude and a slow independent envelope so the topography dots visibly pulse. The synthetic data feeds the real signal pipeline — you can run baseline collection, start all four dimension measurements, and toggle between visualization modes.
+
+```bash
+cd app/eeg-viewer
+cargo run --release -- --simulate
+```
+
+This is the fastest way to iterate on visualization code or verify the dimension measurement flow end-to-end.
+
+### Test server integration
 
 The `eegm-test-sender` generates synthetic multi-headband EEG with realistic signal profiles (alpha, theta, beta, mixed) and timestamps.
 
@@ -114,6 +128,7 @@ cargo run --release --bin eegm-test-sender -- --target 127.0.0.1:41820 --headban
 
 | Flag | Description |
 | ---- | ----------- |
+| `--simulate` | Launch with a simulated Muse device (synthetic EEG, no BLE) |
 | `--server ADDR` | Connect to inference server at ADDR |
 | `--stdin` | Read EEGF/EEGD from stdin, disables BLE |
 | `--tcp ADDR` | Listen for one TCP client, disables BLE |

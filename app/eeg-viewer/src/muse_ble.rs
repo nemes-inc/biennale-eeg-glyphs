@@ -17,6 +17,7 @@ use crate::device_state::{
     build_eegm_frame, chunk_ready, drain_chunk, DeviceState, HeadbandId, SessionWriter,
     SharedOutboundTx,
 };
+use crate::signal_pipeline::{ChannelId, PipelineCommand, SignalPipeline};
 
 /// Samples to accumulate before flushing to shared state.
 const CHUNK: usize = 256;
@@ -81,12 +82,14 @@ pub fn spawn_scan_task(
 }
 
 /// Spawn a BLE streaming task for one specific Muse device.
+/// Accepts a command receiver for UI to pipeline communication.
 pub fn spawn_device_ble_task(
     device: MuseDevice,
     headband_id: HeadbandId,
     state: Arc<Mutex<DeviceState>>,
     outbound_tx: SharedOutboundTx,
     session_path: Option<PathBuf>,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PipelineCommand>,
     rt: &tokio::runtime::Runtime,
 ) -> DeviceBleHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -100,6 +103,7 @@ pub fn spawn_device_ble_task(
             stop_clone,
             outbound_tx,
             session_path,
+            cmd_rx,
         )
         .await
         {
@@ -123,6 +127,7 @@ async fn run_device_ble_loop(
     stop: Arc<AtomicBool>,
     outbound_tx: SharedOutboundTx,
     session_path: Option<PathBuf>,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PipelineCommand>,
 ) -> Result<()> {
     {
         let mut st = state.lock().unwrap();
@@ -160,6 +165,7 @@ async fn run_device_ble_loop(
 
     let mut channel_accum: Vec<Vec<f32>> = vec![Vec::new(); CHANNELS];
     let mut epoch_seq: u32 = 0;
+    let mut pipeline = SignalPipeline::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -172,6 +178,18 @@ async fn run_device_ble_loop(
 
                 match evt {
                     MuseEvent::Eeg(r) if (r.electrode as usize) < CHANNELS => {
+                        // Feed signal pipeline with original f64 samples
+                        if let Some(ch) = ChannelId::new(r.electrode as usize) {
+                            pipeline.ingest_samples(ch, &r.samples);
+                            // Run analysis on TP9 to avoid multi-channel double-trigger
+                            if ch == ChannelId::TP9 {
+                                if let Some(frame) = pipeline.try_analyze() {
+                                    state.lock().unwrap().analysis = frame;
+                                }
+                            }
+                        }
+
+                        // Existing EEGM frame path, casts to f32 independently
                         channel_accum[r.electrode as usize]
                             .extend(r.samples.iter().map(|&s| s as f32));
 
@@ -199,7 +217,7 @@ async fn run_device_ble_loop(
                             }
                             epoch_seq = epoch_seq.wrapping_add(1);
 
-                            // Update shared state (for UI + counters)
+                            // Update shared state for UI and counters
                             {
                                 let mut st = state.lock().unwrap();
                                 st.push_raw_frame(frame, timestamp_us);
@@ -223,6 +241,12 @@ async fn run_device_ble_loop(
                         break;
                     }
                     _ => {}
+                }
+            }
+            // Pipeline commands from UI thread
+            Some(cmd) = cmd_rx.recv() => {
+                if let Err(reason) = pipeline.execute_command(cmd) {
+                    warn!("Pipeline command rejected: {reason}");
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
