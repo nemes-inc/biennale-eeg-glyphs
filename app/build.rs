@@ -78,6 +78,7 @@ fn main() {
             .include(format!("{act_lib}/include"))
             .include(format!("{act_lib}/lib"))
             .include("/usr/local/include")
+            .include("/opt/homebrew/include")
             .warnings(false); // suppress ALGLIB sprintf deprecation warnings
 
         for src in &act_sources {
@@ -92,7 +93,8 @@ fn main() {
 
         // Link system libraries
         println!("cargo:rustc-link-search=native=/usr/local/lib");
-        println!("cargo:rustc-link-lib=static=mlx");
+        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+        println!("cargo:rustc-link-lib=dylib=mlx");
         println!("cargo:rustc-link-lib=framework=Accelerate");
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
