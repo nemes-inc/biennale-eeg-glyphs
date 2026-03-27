@@ -5,7 +5,7 @@ Multi-Muse EEG viewer with per-device recording and real-time ZUNA inference ove
 ## What it does
 
 - Connects up to 4 Muse headsets over BLE with per-device tabbed waveforms
-- Runs four psychological dimension measurements in real-time (Absorption, Attunement, The Unknown, Witnessed)
+- Runs four psychological dimension measurements on **inference-reconstructed data** (Absorption, Attunement, The Unknown, Witnessed)
 - Two visualization modes: **Neural Aura** (arc gauge cards) and **Brain Topography** (wireframe head map with electrode glow)
 - Records independently per device to FIF files
 - Streams raw EEG to a Python inference server over TCP using the EEGM binary protocol
@@ -105,9 +105,25 @@ cd app/eeg-viewer
 
 Click Scan to find Muse headsets, click a device to connect, then click Connect Server. The bottom status bar shows frame counters for local processing, disk writes, and server sends. Reconstructed traces overlay in red at the original capture timestamp.
 
+## Inference-driven dimension analysis
+
+All four dimension measurements (baseline, absorption, attunement, the unknown, witnessed) run on **reconstructed data from the inference server**, not raw Muse data. The flow is:
+
+1. Raw EEG is streamed from Muse headset → written to session file → sent to inference server
+2. Server returns reconstructed EEGM frames → fed into `DeviceState`'s inference `SignalPipeline`
+3. The pipeline filters, windows, computes FFT/ACT, and feeds detectors
+4. UI reads the resulting `AnalysisFrame` from `DeviceState`
+
+Detectors use **data-driven timing** (snapshot/window counts) instead of wall-clock durations. This means:
+- Phases transition when enough data has been accumulated, regardless of network latency
+- The settling and recording phases won't advance until inference data actually arrives
+- Progress bars reflect actual data volume, not elapsed time
+
+The Neural Aura panel shows a status banner indicating inference connectivity and data flow.
+
 ### Simulate mode
 
-The `--simulate` flag spawns a fake Muse device generating synthetic 4-channel EEG at 256 Hz. Each channel has a different alpha amplitude and a slow independent envelope so the topography dots visibly pulse. The synthetic data feeds the real signal pipeline — you can run baseline collection, start all four dimension measurements, and toggle between visualization modes.
+The `--simulate` flag spawns a fake Muse device generating synthetic 4-channel EEG at 256 Hz. Each channel has a different alpha amplitude and a slow independent envelope so the topography dots visibly pulse. Dimension analysis requires a connected inference server — the simulated device streams raw data to the server, and analysis runs on the reconstructed responses.
 
 ```bash
 cd app/eeg-viewer

@@ -18,8 +18,6 @@
 //!
 //! Default threshold: 25 % (conservative). Adjustable at runtime.
 
-use std::time::Instant;
-
 use crate::alpha::{FftSnapshot, NUM_CH, CH_AF7, CH_AF8};
 use crate::baseline::BaselineResult;
 use crate::compute::ContactQuality;
@@ -27,30 +25,32 @@ use crate::compute::ContactQuality;
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Tuneable parameters for the absorption measurement.
+///
+/// Data-driven: uses snapshot counts instead of wall-clock durations.
 #[derive(Debug, Clone)]
 pub struct AbsorptionConfig {
     /// Threshold (percent) above which absorption is classified as "Deep".
     pub threshold_pct: f64,
-    /// Total measurement duration in seconds.
-    pub measurement_duration_s: f64,
-    /// Initial settling period (discarded) in seconds.
-    pub settling_duration_s: f64,
+    /// Snapshots to discard during settling.
+    pub settling_snapshots: usize,
+    /// Snapshots to accumulate during measuring.
+    pub measuring_snapshots: usize,
 }
 
 impl Default for AbsorptionConfig {
     fn default() -> Self {
         Self {
             threshold_pct: 25.0,
-            measurement_duration_s: 45.0,
-            settling_duration_s: 5.0,
+            settling_snapshots: 20,  // ~5 s at 4 hops/s
+            measuring_snapshots: 160, // ~40 s at 4 hops/s
         }
     }
 }
 
 impl AbsorptionConfig {
-    /// Effective recording duration (total minus settling).
-    pub fn recording_duration_s(&self) -> f64 {
-        self.measurement_duration_s - self.settling_duration_s
+    /// Total snapshots required (settling + measuring).
+    pub fn total_snapshots(&self) -> usize {
+        self.settling_snapshots + self.measuring_snapshots
     }
 }
 
@@ -141,8 +141,8 @@ pub struct AbsorptionResult {
     pub label: AbsorptionLabel,
     /// Overall artifact ratio during measurement.
     pub artifact_ratio: f64,
-    /// Effective recording duration (seconds).
-    pub recording_duration_s: f64,
+    /// Total measuring snapshots accumulated.
+    pub measuring_snapshots: usize,
     /// Total clean snapshots accumulated.
     pub total_clean_snapshots: usize,
 }
@@ -150,11 +150,16 @@ pub struct AbsorptionResult {
 // ── Detector ─────────────────────────────────────────────────────────────────
 
 /// State machine that measures absorption by comparing immersion alpha to baseline.
+///
+/// Data-driven: phases transition based on snapshot counts, not wall-clock.
 #[derive(Debug, Clone)]
 pub struct AbsorptionDetector {
     pub config: AbsorptionConfig,
     pub phase: AbsorptionPhase,
-    start_time: Option<Instant>,
+    /// Snapshots received during settling (discarded).
+    settling_count: usize,
+    /// Snapshots received during measuring.
+    measuring_count: usize,
     /// Per-channel accumulators for immersion period.
     pub channels: [ChannelAccum; NUM_CH],
     /// Baseline alpha per channel (copied from BaselineResult on start).
@@ -168,7 +173,8 @@ impl Default for AbsorptionDetector {
         Self {
             config: AbsorptionConfig::default(),
             phase: AbsorptionPhase::Idle,
-            start_time: None,
+            settling_count: 0,
+            measuring_count: 0,
             channels: std::array::from_fn(|_| ChannelAccum::default()),
             baseline_alpha: None,
             result: None,
@@ -183,7 +189,8 @@ impl AbsorptionDetector {
     pub fn start(&mut self, baseline: &BaselineResult) -> bool {
         self.baseline_alpha = Some(baseline.channel_alpha);
         self.phase = AbsorptionPhase::Settling;
-        self.start_time = Some(Instant::now());
+        self.settling_count = 0;
+        self.measuring_count = 0;
         for ch in &mut self.channels {
             ch.reset();
         }
@@ -199,7 +206,6 @@ impl AbsorptionDetector {
     /// Stop measurement and return to Idle.
     pub fn stop(&mut self) {
         self.phase = AbsorptionPhase::Idle;
-        self.start_time = None;
     }
 
     /// Whether the detector is actively running (settling or measuring).
@@ -207,25 +213,14 @@ impl AbsorptionDetector {
         matches!(self.phase, AbsorptionPhase::Settling | AbsorptionPhase::Measuring)
     }
 
-    /// Seconds elapsed since start.
-    pub fn elapsed_s(&self) -> f64 {
-        self.start_time
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0)
-    }
-
-    /// Seconds elapsed in the measuring phase specifically.
-    pub fn measuring_elapsed_s(&self) -> f64 {
-        (self.elapsed_s() - self.config.settling_duration_s).max(0.0)
-    }
-
     /// Overall progress fraction (0.0–1.0).
     pub fn progress(&self) -> f64 {
-        let total = self.config.measurement_duration_s;
-        if total <= 0.0 {
+        let total = self.config.total_snapshots();
+        if total == 0 {
             return 1.0;
         }
-        (self.elapsed_s() / total).clamp(0.0, 1.0)
+        let done = self.settling_count + self.measuring_count;
+        (done as f64 / total as f64).clamp(0.0, 1.0)
     }
 
     /// Compute the *live* absorption percentage from accumulated data so far.
@@ -278,8 +273,6 @@ impl AbsorptionDetector {
         epoch_ok: &[bool; NUM_CH],
         contact: &[ContactQuality; NUM_CH],
     ) -> &AbsorptionPhase {
-        let elapsed = self.elapsed_s();
-
         match self.phase {
             AbsorptionPhase::Idle
             | AbsorptionPhase::NeedBaseline
@@ -287,7 +280,8 @@ impl AbsorptionDetector {
                 return &self.phase;
             }
             AbsorptionPhase::Settling => {
-                if elapsed >= self.config.settling_duration_s {
+                self.settling_count += 1;
+                if self.settling_count >= self.config.settling_snapshots {
                     self.phase = AbsorptionPhase::Measuring;
                 } else {
                     return &self.phase;
@@ -297,6 +291,7 @@ impl AbsorptionDetector {
         }
 
         // ── Measuring: accumulate per-channel alpha ─────────────────────
+        self.measuring_count += 1;
         for ch in 0..NUM_CH {
             self.channels[ch].total_snapshots += 1;
             let is_clean = epoch_ok[ch] && contact[ch] != ContactQuality::NoContact;
@@ -307,7 +302,7 @@ impl AbsorptionDetector {
         }
 
         // ── Check completion ────────────────────────────────────────────
-        if elapsed >= self.config.measurement_duration_s {
+        if self.measuring_count >= self.config.measuring_snapshots {
             self.finish();
         }
 
@@ -359,7 +354,7 @@ impl AbsorptionDetector {
             threshold_pct: self.config.threshold_pct,
             label,
             artifact_ratio: worst_artifact,
-            recording_duration_s: self.measuring_elapsed_s(),
+            measuring_snapshots: self.measuring_count,
             total_clean_snapshots: total_clean,
         });
 

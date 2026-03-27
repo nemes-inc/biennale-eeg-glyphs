@@ -7,6 +7,14 @@ use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke, Vec2};
 
 use crate::signal_pipeline::{DimensionCard, DimensionReading};
 
+/// Info needed for the inference data status indicator.
+#[derive(Clone, Debug)]
+pub struct InferenceStatus {
+    pub server_connected: bool,
+    pub recon_frame_count: u64,
+    pub recon_snapshots_fed: u64,
+}
+
 // ── Arc gauge constants ──────────────────────────────────────────────────────
 
 const ARC_START: f32 = std::f32::consts::PI * 0.75;   // 135 degrees, bottom-left
@@ -74,13 +82,73 @@ fn sparkline_points(values: &[f32], rect: Rect) -> Vec<Pos2> {
 
 // ── Pragmatic rendering ──────────────────────────────────────────────────────
 
-pub fn render_neural_aura(ui: &mut egui::Ui, cards: &[DimensionCard; 4]) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        for card in cards {
-            paint_dimension_card(ui, card);
-        }
-    });
+pub fn render_neural_aura(
+    ui: &mut egui::Ui,
+    cards: &[DimensionCard; 4],
+    inference: &InferenceStatus,
+) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+
+            // Inference data status banner
+            paint_inference_status(ui, inference);
+
+            for card in cards {
+                paint_dimension_card(ui, card);
+            }
+        });
+}
+
+fn paint_inference_status(ui: &mut egui::Ui, status: &InferenceStatus) {
+    let (icon, text, color) = if !status.server_connected {
+        (
+            "\u{26A0}",
+            "Server disconnected".to_string(),
+            Color32::from_rgb(255, 100, 100),
+        )
+    } else if status.recon_snapshots_fed == 0 {
+        (
+            "\u{23F3}",
+            format!(
+                "Waiting for inference data... ({} frames recv'd)",
+                status.recon_frame_count
+            ),
+            Color32::from_rgb(255, 180, 0),
+        )
+    } else {
+        (
+            "\u{2705}",
+            format!(
+                "Inference active \u{2014} {} analysis snapshots",
+                status.recon_snapshots_fed
+            ),
+            Color32::from_rgb(80, 200, 120),
+        )
+    };
+
+    egui::Frame::none()
+        .fill(Color32::from_rgba_unmultiplied(10, 10, 14, 180))
+        .stroke(Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(40, 40, 56, 60),
+        ))
+        .rounding(6.0)
+        .inner_margin(6.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(icon)
+                        .size(12.0),
+                );
+                ui.label(
+                    egui::RichText::new(&text)
+                        .color(color)
+                        .size(10.0),
+                );
+            });
+        });
 }
 
 fn paint_glass_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {

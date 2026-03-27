@@ -10,7 +10,7 @@ use std::sync::Arc;
 use muse_rs::eegm::{EegmFrame, HEADER_SIZE};
 use tokio::sync::mpsc;
 
-use crate::signal_pipeline::{AnalysisFrame, PipelineCommand};
+use crate::signal_pipeline::{AnalysisFrame, ChannelId, PipelineCommand, SignalPipeline};
 
 /// Channel for sending EEGM frames to the inference server.
 pub type OutboundTx = mpsc::UnboundedSender<EegmFrame>;
@@ -104,8 +104,14 @@ pub struct DeviceState {
 
     max_points: usize,
 
-    /// Dimension analysis snapshot, written by BLE pipeline, read by UI.
+    /// Dimension analysis snapshot, produced by inference pipeline, read by UI.
     pub analysis: AnalysisFrame,
+
+    /// Signal pipeline that runs dimension analysis on reconstructed data.
+    inference_pipeline: SignalPipeline,
+
+    /// Number of reconstructed snapshots fed to the inference pipeline.
+    pub recon_snapshots_fed: u64,
 }
 
 impl DeviceState {
@@ -127,6 +133,8 @@ impl DeviceState {
             stream_start_us: None,
             max_points,
             analysis: AnalysisFrame::default(),
+            inference_pipeline: SignalPipeline::new(),
+            recon_snapshots_fed: 0,
         }
     }
 
@@ -165,6 +173,8 @@ impl DeviceState {
 
     /// Push reconstructed EEG from inference server with the original capture timestamp.
     /// If `timestamp_us` is 0 (server didn't preserve it), falls back to current raw position.
+    ///
+    /// Also feeds the inference signal pipeline for dimension analysis.
     pub fn push_reconstructed_frame(&mut self, channels: Vec<Vec<f32>>, timestamp_us: u64) {
         let base_secs = if timestamp_us > 0 {
             self.relative_secs(timestamp_us)
@@ -179,11 +189,31 @@ impl DeviceState {
         while self.recon_channels.len() < channels.len() {
             self.recon_channels.push(Vec::new());
         }
+
+        // Feed reconstructed samples into the inference pipeline for dimension analysis
         for (ch_idx, samples) in channels.iter().enumerate() {
             let timed = samples_to_timed(samples, base_secs);
             push_rolling_timed(&mut self.recon_channels[ch_idx], &timed, self.max_points);
+
+            // Feed inference pipeline (expects f64)
+            if let Some(ch) = ChannelId::new(ch_idx) {
+                let f64_samples: Vec<f64> = samples.iter().map(|&s| s as f64).collect();
+                self.inference_pipeline.ingest_samples(ch, &f64_samples);
+            }
         }
+
+        // Try to produce an analysis frame from inference data
+        if let Some(frame) = self.inference_pipeline.try_analyze() {
+            self.analysis = frame;
+            self.recon_snapshots_fed += 1;
+        }
+
         self.recon_frame_count += 1;
+    }
+
+    /// Execute a pipeline command on the inference pipeline.
+    pub fn execute_pipeline_command(&mut self, cmd: PipelineCommand) -> Result<(), &'static str> {
+        self.inference_pipeline.execute_command(cmd)
     }
 
     /// Convert an absolute timestamp to seconds relative to stream start.

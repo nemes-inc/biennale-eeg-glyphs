@@ -28,39 +28,39 @@
 //!
 //! Default deadband: ±0.10 (conservative, exceeds Muse noise floor ±0.05–0.08).
 
-use std::time::Instant;
-
 use crate::alpha::{FftSnapshot, NUM_CH, CH_AF7, CH_AF8};
 use crate::compute::ContactQuality;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Tuneable parameters for the approach/withdraw measurement.
+///
+/// Data-driven: uses snapshot counts instead of wall-clock durations.
 #[derive(Debug, Clone)]
 pub struct ApproachConfig {
     /// Deadband half-width for high-confidence classification.
     /// Scores inside ±deadband are classified with low confidence.
     pub deadband: f64,
-    /// Total measurement duration in seconds (including settling).
-    pub measurement_duration_s: f64,
-    /// Initial settling period (discarded) in seconds.
-    pub settling_duration_s: f64,
+    /// Snapshots to discard during settling.
+    pub settling_snapshots: usize,
+    /// Snapshots to accumulate during measuring.
+    pub measuring_snapshots: usize,
 }
 
 impl Default for ApproachConfig {
     fn default() -> Self {
         Self {
             deadband: 0.10,
-            measurement_duration_s: 23.0, // 3 s settling + 20 s recording
-            settling_duration_s: 3.0,
+            settling_snapshots: 12,  // ~3 s at 4 hops/s
+            measuring_snapshots: 80, // ~20 s at 4 hops/s
         }
     }
 }
 
 impl ApproachConfig {
-    /// Effective recording duration (total minus settling).
-    pub fn recording_duration_s(&self) -> f64 {
-        self.measurement_duration_s - self.settling_duration_s
+    /// Total snapshots required (settling + measuring).
+    pub fn total_snapshots(&self) -> usize {
+        self.settling_snapshots + self.measuring_snapshots
     }
 }
 
@@ -169,8 +169,8 @@ pub struct ApproachResult {
     pub confidence: ApproachConfidence,
     /// Worst-channel artifact ratio during measurement.
     pub artifact_ratio: f64,
-    /// Effective recording duration (seconds).
-    pub recording_duration_s: f64,
+    /// Total measuring snapshots accumulated.
+    pub measuring_snapshots: usize,
     /// Total clean snapshots accumulated (sum of AF7 + AF8).
     pub total_clean_snapshots: usize,
 }
@@ -206,11 +206,16 @@ pub fn classify(asymmetry: f64, deadband: f64) -> (ApproachLabel, ApproachConfid
 }
 
 /// State machine that measures approach/withdraw via frontal alpha asymmetry.
+///
+/// Data-driven: phases transition based on snapshot counts, not wall-clock.
 #[derive(Debug, Clone)]
 pub struct ApproachDetector {
     pub config: ApproachConfig,
     pub phase: ApproachPhase,
-    start_time: Option<Instant>,
+    /// Snapshots received during settling (discarded).
+    settling_count: usize,
+    /// Snapshots received during measuring.
+    measuring_count: usize,
     /// Per-channel accumulators (only AF7 and AF8 are used for the score).
     pub channels: [ChannelAccum; NUM_CH],
     /// Completed result.
@@ -222,7 +227,8 @@ impl Default for ApproachDetector {
         Self {
             config: ApproachConfig::default(),
             phase: ApproachPhase::Idle,
-            start_time: None,
+            settling_count: 0,
+            measuring_count: 0,
             channels: std::array::from_fn(|_| ChannelAccum::default()),
             result: None,
         }
@@ -233,7 +239,8 @@ impl ApproachDetector {
     /// Start a new measurement.
     pub fn start(&mut self) {
         self.phase = ApproachPhase::Settling;
-        self.start_time = Some(Instant::now());
+        self.settling_count = 0;
+        self.measuring_count = 0;
         for ch in &mut self.channels {
             ch.reset();
         }
@@ -243,7 +250,6 @@ impl ApproachDetector {
     /// Stop measurement and return to Idle.
     pub fn stop(&mut self) {
         self.phase = ApproachPhase::Idle;
-        self.start_time = None;
     }
 
     /// Whether the detector is actively running (settling or measuring).
@@ -251,25 +257,14 @@ impl ApproachDetector {
         matches!(self.phase, ApproachPhase::Settling | ApproachPhase::Measuring)
     }
 
-    /// Seconds elapsed since start.
-    pub fn elapsed_s(&self) -> f64 {
-        self.start_time
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0)
-    }
-
-    /// Seconds elapsed in the measuring phase specifically.
-    pub fn measuring_elapsed_s(&self) -> f64 {
-        (self.elapsed_s() - self.config.settling_duration_s).max(0.0)
-    }
-
     /// Overall progress fraction (0.0–1.0).
     pub fn progress(&self) -> f64 {
-        let total = self.config.measurement_duration_s;
-        if total <= 0.0 {
+        let total = self.config.total_snapshots();
+        if total == 0 {
             return 1.0;
         }
-        (self.elapsed_s() / total).clamp(0.0, 1.0)
+        let done = self.settling_count + self.measuring_count;
+        (done as f64 / total as f64).clamp(0.0, 1.0)
     }
 
     /// Compute live asymmetry from accumulated data.
@@ -301,14 +296,13 @@ impl ApproachDetector {
         epoch_ok: &[bool; NUM_CH],
         contact: &[ContactQuality; NUM_CH],
     ) -> &ApproachPhase {
-        let elapsed = self.elapsed_s();
-
         match self.phase {
             ApproachPhase::Idle | ApproachPhase::Complete => {
                 return &self.phase;
             }
             ApproachPhase::Settling => {
-                if elapsed >= self.config.settling_duration_s {
+                self.settling_count += 1;
+                if self.settling_count >= self.config.settling_snapshots {
                     self.phase = ApproachPhase::Measuring;
                 } else {
                     return &self.phase;
@@ -318,6 +312,7 @@ impl ApproachDetector {
         }
 
         // ── Measuring: accumulate per-channel alpha ─────────────────────
+        self.measuring_count += 1;
         for ch in 0..NUM_CH {
             self.channels[ch].total_snapshots += 1;
             let is_clean = epoch_ok[ch] && contact[ch] != ContactQuality::NoContact;
@@ -328,7 +323,7 @@ impl ApproachDetector {
         }
 
         // ── Check completion ────────────────────────────────────────────
-        if elapsed >= self.config.measurement_duration_s {
+        if self.measuring_count >= self.config.measuring_snapshots {
             self.finish();
         }
 
@@ -359,7 +354,7 @@ impl ApproachDetector {
             label,
             confidence,
             artifact_ratio: worst_artifact,
-            recording_duration_s: self.measuring_elapsed_s(),
+            measuring_snapshots: self.measuring_count,
             total_clean_snapshots: total_clean,
         });
 

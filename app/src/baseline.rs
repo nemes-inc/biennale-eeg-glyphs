@@ -14,20 +14,21 @@
 //! The detector auto-completes when the recording phase ends, or fails if
 //! more than 30 % of epochs are rejected by artifact checks.
 
-use std::time::Instant;
-
 use crate::alpha::{FftSnapshot, NUM_CH, CH_AF7, CH_AF8};
 use crate::compute::ContactQuality;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Tuneable parameters for the baseline protocol.
+///
+/// Uses snapshot counts instead of wall-clock durations so that the
+/// detector works correctly with delayed data (e.g. inference server).
 #[derive(Debug, Clone)]
 pub struct BaselineConfig {
-    /// Total baseline duration in seconds (settling + recording).
-    pub total_duration_s: f64,
-    /// Duration of the initial settling period (discarded data).
-    pub settling_duration_s: f64,
+    /// Snapshots to discard during settling (data observed but not recorded).
+    pub settling_snapshots: usize,
+    /// Clean snapshots to accumulate during recording.
+    pub recording_snapshots: usize,
     /// Maximum allowed artifact ratio (0.0–1.0). If exceeded → fail.
     pub max_artifact_ratio: f64,
     /// Maximum allowed coefficient of variation for alpha across epochs.
@@ -37,8 +38,8 @@ pub struct BaselineConfig {
 impl Default for BaselineConfig {
     fn default() -> Self {
         Self {
-            total_duration_s: 60.0,
-            settling_duration_s: 15.0,
+            settling_snapshots: 60,   // ~15 s at 4 hops/s
+            recording_snapshots: 180, // ~45 s at 4 hops/s
             max_artifact_ratio: 0.30,
             max_alpha_cv: 0.30,
         }
@@ -46,9 +47,9 @@ impl Default for BaselineConfig {
 }
 
 impl BaselineConfig {
-    /// Effective recording duration (total minus settling).
-    pub fn recording_duration_s(&self) -> f64 {
-        self.total_duration_s - self.settling_duration_s
+    /// Total snapshots required (settling + recording).
+    pub fn total_snapshots(&self) -> usize {
+        self.settling_snapshots + self.recording_snapshots
     }
 }
 
@@ -169,8 +170,8 @@ pub struct BaselineResult {
     pub noise_theta: f64,
     /// Overall artifact ratio (worst channel).
     pub overall_artifact_ratio: f64,
-    /// Actual recording duration (seconds).
-    pub recording_duration_s: f64,
+    /// Total recording snapshots accumulated.
+    pub recording_snapshots: usize,
     /// Total clean snapshots accumulated across all channels.
     pub total_clean_snapshots: usize,
 }
@@ -178,12 +179,16 @@ pub struct BaselineResult {
 // ── Detector ─────────────────────────────────────────────────────────────────
 
 /// State machine that implements the two-phase baseline protocol.
+///
+/// Data-driven: phases transition based on snapshot counts, not wall-clock.
 #[derive(Debug, Clone)]
 pub struct BaselineDetector {
     pub config: BaselineConfig,
     pub phase: BaselinePhase,
-    /// Wall-clock instant when `start()` was called.
-    start_time: Option<Instant>,
+    /// Snapshots received during settling (discarded).
+    settling_count: usize,
+    /// Snapshots received during recording (all, including rejected).
+    recording_count: usize,
     /// Per-channel accumulators.
     pub channels: [ChannelAccum; NUM_CH],
     /// Completed baseline (set when phase transitions to `Complete`).
@@ -195,7 +200,8 @@ impl Default for BaselineDetector {
         Self {
             config: BaselineConfig::default(),
             phase: BaselinePhase::Idle,
-            start_time: None,
+            settling_count: 0,
+            recording_count: 0,
             channels: std::array::from_fn(|_| ChannelAccum::default()),
             result: None,
         }
@@ -206,7 +212,8 @@ impl BaselineDetector {
     /// Start (or restart) the baseline collection.
     pub fn start(&mut self) {
         self.phase = BaselinePhase::Settling;
-        self.start_time = Some(Instant::now());
+        self.settling_count = 0;
+        self.recording_count = 0;
         for ch in &mut self.channels {
             ch.reset();
         }
@@ -216,40 +223,21 @@ impl BaselineDetector {
     /// Stop the baseline collection and return to idle.
     pub fn stop(&mut self) {
         self.phase = BaselinePhase::Idle;
-        self.start_time = None;
-    }
-
-    /// Seconds elapsed since start (0.0 if not running).
-    pub fn elapsed_s(&self) -> f64 {
-        self.start_time
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0)
-    }
-
-    /// Seconds remaining in the current phase.
-    pub fn remaining_s(&self) -> f64 {
-        let elapsed = self.elapsed_s();
-        match self.phase {
-            BaselinePhase::Settling => {
-                (self.config.settling_duration_s - elapsed).max(0.0)
-            }
-            BaselinePhase::Recording => {
-                (self.config.total_duration_s - elapsed).max(0.0)
-            }
-            _ => 0.0,
-        }
     }
 
     /// Progress fraction (0.0–1.0) across the entire protocol.
     pub fn progress(&self) -> f64 {
-        let elapsed = self.elapsed_s();
-        (elapsed / self.config.total_duration_s).clamp(0.0, 1.0)
+        let total = self.config.total_snapshots();
+        if total == 0 {
+            return 1.0;
+        }
+        let done = self.settling_count + self.recording_count;
+        (done as f64 / total as f64).clamp(0.0, 1.0)
     }
 
-    /// Seconds elapsed in the recording phase specifically.
-    pub fn recording_elapsed_s(&self) -> f64 {
-        let elapsed = self.elapsed_s();
-        (elapsed - self.config.settling_duration_s).max(0.0)
+    /// Snapshots accumulated so far during recording.
+    pub fn recording_snapshot_count(&self) -> usize {
+        self.recording_count
     }
 
     /// Feed a new FFT snapshot from the signal pipeline.
@@ -264,14 +252,13 @@ impl BaselineDetector {
         epoch_ok: &[bool; NUM_CH],
         contact: &[ContactQuality; NUM_CH],
     ) -> &BaselinePhase {
-        let elapsed = self.elapsed_s();
-
         match self.phase {
             BaselinePhase::Idle | BaselinePhase::Complete | BaselinePhase::Failed(_) => {
                 return &self.phase;
             }
             BaselinePhase::Settling => {
-                if elapsed >= self.config.settling_duration_s {
+                self.settling_count += 1;
+                if self.settling_count >= self.config.settling_snapshots {
                     self.phase = BaselinePhase::Recording;
                     // Fall through to process this snapshot as recording
                 } else {
@@ -282,6 +269,7 @@ impl BaselineDetector {
         }
 
         // ── Recording phase: accumulate per-channel data ────────────────
+        self.recording_count += 1;
         for ch in 0..NUM_CH {
             self.channels[ch].total_snapshots += 1;
 
@@ -296,8 +284,8 @@ impl BaselineDetector {
             }
         }
 
-        // ── Check completion / failure ──────────────────────────────────
-        if elapsed >= self.config.total_duration_s {
+        // ── Check completion ──────────────────────────────────────────
+        if self.recording_count >= self.config.recording_snapshots {
             self.finish();
         }
 
@@ -365,7 +353,7 @@ impl BaselineDetector {
             noise_delta,
             noise_theta,
             overall_artifact_ratio: worst_artifact,
-            recording_duration_s: self.recording_elapsed_s(),
+            recording_snapshots: self.recording_count,
             total_clean_snapshots: total_clean,
         };
 

@@ -123,6 +123,13 @@ struct Args {
     /// Launch with a simulated Muse device (synthetic EEG, no BLE needed).
     #[arg(long)]
     simulate: bool,
+
+    /// Path to `services/print-glyph` directory.
+    #[arg(
+        long,
+        default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../services/print-glyph")
+    )]
+    print_glyph_dir: PathBuf,
 }
 
 /// Job events from background Record / Preprocess threads.
@@ -188,10 +195,19 @@ struct EegViewerApp {
     pipeline_step: Option<(u8, u8)>,
     pipeline_label: String,
 
+    // ── Glyph print selection ──
+    glyph_absorption: (bool, usize),  // (include, 0=deep/1=surface)
+    glyph_attunement: (bool, usize),  // (include, 0=porous/1=boundaried)
+    glyph_unknown: (bool, usize),     // (include, 0=lean_in/1=hold_back)
+    glyph_witnessed: (bool, usize),   // (include, 0=approach/1=withdraw)
+
     // ── Config ──
     max_points: usize,
     input_kind: InputKind,
     tokio_rt: Arc<tokio::runtime::Runtime>,
+    print_glyph_dir: PathBuf,
+    #[allow(dead_code)]
+    simulate: bool,
 
     // ── Legacy single-device state (stdin/TCP modes) ──
     legacy_state: Option<Arc<Mutex<SharedState>>>,
@@ -204,6 +220,11 @@ struct EegViewerApp {
 
 const COLOR_ORIGINAL: egui::Color32 = egui::Color32::from_rgb(0, 128, 255);
 const COLOR_RECONSTRUCTED: egui::Color32 = egui::Color32::from_rgb(255, 48, 48);
+
+const ABSORPTION_OPTS: [&str; 2] = ["deep", "surface"];
+const ATTUNEMENT_OPTS: [&str; 2] = ["porous", "boundaried"];
+const UNKNOWN_OPTS: [&str; 2] = ["lean_in", "hold_back"];
+const WITNESSED_OPTS: [&str; 2] = ["approach", "withdraw"];
 
 fn resolve_input_kind(args: &Args) -> InputKind {
     if args.tcp.is_some() {
@@ -337,7 +358,6 @@ impl EegViewerApp {
     fn spawn_simulated_device(&mut self) {
         use std::sync::atomic::AtomicBool;
         use device_state::HeadbandId;
-        use signal_pipeline::{ChannelId, SignalPipeline};
 
         let headband_id = HeadbandId::new(0).unwrap();
         let state = Arc::new(Mutex::new(DeviceState::new(
@@ -349,10 +369,7 @@ impl EegViewerApp {
         let stop_clone = Arc::clone(&stop);
         let state_clone = Arc::clone(&state);
 
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-
         let join = self.tokio_rt.spawn(async move {
-            let mut pipeline = SignalPipeline::new();
             let mut t: f64 = 0.0;
             let dt = 1.0 / 256.0;
             let samples_per_packet = 12; // Muse sends 12 samples per BLE packet
@@ -362,25 +379,15 @@ impl EegViewerApp {
                     break;
                 }
 
-                // Drain any pending commands
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    if let Err(reason) = pipeline.execute_command(cmd) {
-                        log::warn!("Sim pipeline command rejected: {reason}");
-                    }
-                }
-
                 // Generate synthetic EEG: 10 Hz alpha with per-channel
                 // amplitude modulation so electrode dots visibly differ.
-                // Each channel has a slow envelope (0.05-0.15 Hz) that makes
-                // alpha power wax and wane independently.
                 let mut frame: Vec<Vec<f32>> = Vec::with_capacity(4);
                 let ch_envelope_freq = [0.07, 0.11, 0.13, 0.05]; // Hz
                 let ch_base_amp = [15.0, 25.0, 20.0, 30.0]; // µV
                 for ch_idx in 0..4usize {
-                    let samples: Vec<f64> = (0..samples_per_packet)
+                    let samples: Vec<f32> = (0..samples_per_packet)
                         .map(|i| {
                             let ti = t + i as f64 * dt;
-                            // Slow envelope modulates alpha amplitude per channel
                             let envelope = 0.3 + 0.7
                                 * (2.0 * std::f64::consts::PI * ch_envelope_freq[ch_idx] * ti)
                                     .sin()
@@ -389,20 +396,10 @@ impl EegViewerApp {
                                 * (2.0 * std::f64::consts::PI * 10.0 * ti).sin();
                             let noise = 3.0
                                 * (2.0 * std::f64::consts::PI * 47.3 * ti + ch_idx as f64).sin();
-                            alpha + noise
+                            (alpha + noise) as f32
                         })
                         .collect();
-
-                    if let Some(ch) = ChannelId::new(ch_idx) {
-                        pipeline.ingest_samples(ch, &samples);
-                        if ch == ChannelId::TP9 {
-                            if let Some(analysis) = pipeline.try_analyze() {
-                                state_clone.lock().unwrap().analysis = analysis;
-                            }
-                        }
-                    }
-
-                    frame.push(samples.iter().map(|&s| s as f32).collect());
+                    frame.push(samples);
                 }
 
                 // Feed the waveform display via push_raw_frame
@@ -437,7 +434,7 @@ impl EegViewerApp {
             last_record_toggle: None,
             epoch_seq: 0,
             session_path: None,
-            pipeline_cmd_tx: Some(cmd_tx),
+            pipeline_cmd_tx: None,
         });
 
         self.active_tab = 0;
@@ -662,6 +659,56 @@ impl EegViewerApp {
                 }
                 Err(e) => {
                     let _ = tx.send(JobEvent::LogLine(format!("ZUNA pipeline error: {e}\n")));
+                    let _ = tx.send(JobEvent::Done { ok: false });
+                }
+            }
+        });
+    }
+
+    fn spawn_print_glyph(&mut self, cli_args: Vec<String>) {
+        if self.job_busy {
+            return;
+        }
+
+        let print_glyph_dir = self.print_glyph_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        self.job_rx = Some(rx);
+        self.job_busy = true;
+        self.job_started_at = Some(Instant::now());
+        self.job_last_duration = None;
+        self.pipeline_step = None;
+        self.pipeline_label.clear();
+        self.job_log = format!("Printing glyph: {} ...\n", cli_args.join(" "));
+
+        thread::spawn(move || {
+            let result = Command::new("uv")
+                .arg("run")
+                .arg("--project")
+                .arg(&print_glyph_dir)
+                .arg("python")
+                .arg("-m")
+                .arg("print_glyph.print_receipt")
+                .args(&cli_args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+
+            match result {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    for line in stdout.lines() {
+                        let _ = tx.send(JobEvent::LogLine(format!("{line}\n")));
+                    }
+                    for line in stderr.lines() {
+                        let _ = tx.send(JobEvent::LogLine(format!("{line}\n")));
+                    }
+                    let _ = tx.send(JobEvent::Done { ok: o.status.success() });
+                }
+                Err(e) => {
+                    let _ = tx.send(JobEvent::LogLine(format!(
+                        "Failed to spawn uv: {e}\n(Is `uv` on PATH?)\n"
+                    )));
                     let _ = tx.send(JobEvent::Done { ok: false });
                 }
             }
@@ -908,17 +955,95 @@ impl EegViewerApp {
                 }
             });
 
-            // ── Dimension controls, visible when not in Waveforms mode ──
-            if self.viz_mode != VizMode::Waveforms
-                && self.active_tab < self.connected_devices.len()
+            // ── Dimension controls ──
+            let mut print_args: Option<Vec<String>> = None;
+            if self.active_tab < self.connected_devices.len()
             {
-                let device = &self.connected_devices[self.active_tab];
-                let analysis = device.state.lock().unwrap().analysis.clone();
-                if let Some(ref cmd_tx) = device.pipeline_cmd_tx {
+                let analysis = {
+                    let device = &self.connected_devices[self.active_tab];
+                    let analysis = device.state.lock().unwrap().analysis.clone();
+                    let mut cmds = Vec::new();
                     ui.horizontal(|ui| {
-                        render_dimension_controls(ui, &analysis, cmd_tx);
+                        render_dimension_controls(ui, &analysis, &mut cmds);
                     });
+                    // Execute collected commands on the inference pipeline
+                    if !cmds.is_empty() {
+                        let mut st = device.state.lock().unwrap();
+                        for cmd in cmds {
+                            if let Err(reason) = st.execute_pipeline_command(cmd) {
+                                log::warn!("Pipeline command rejected: {reason}");
+                            }
+                        }
+                    }
+                    analysis
+                };
+
+                // Auto-populate selectors from completed measurements
+                if let Some(args) = glyph_cli_args(&analysis) {
+                    self.glyph_absorption = (true, if args[1] == "deep" { 0 } else { 1 });
+                    self.glyph_attunement = (true, if args[3] == "porous" { 0 } else { 1 });
+                    self.glyph_unknown = (true, if args[5] == "lean_in" { 0 } else { 1 });
+                    self.glyph_witnessed = (true, if args[7] == "approach" { 0 } else { 1 });
                 }
+
+                // Glyph selectors + Print button
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Print:").strong().size(11.0));
+
+                    let selectors: &mut [(&mut (bool, usize), &str, &[&str; 2])] = &mut [
+                        (&mut self.glyph_absorption, "absorption_sel", &ABSORPTION_OPTS),
+                        (&mut self.glyph_attunement, "attunement_sel", &ATTUNEMENT_OPTS),
+                        (&mut self.glyph_unknown, "unknown_sel", &UNKNOWN_OPTS),
+                        (&mut self.glyph_witnessed, "witnessed_sel", &WITNESSED_OPTS),
+                    ];
+                    for (state, id, opts) in selectors.iter_mut() {
+                        ui.checkbox(&mut state.0, "");
+                        ui.add_enabled_ui(state.0, |ui| {
+                            egui::ComboBox::from_id_salt(*id)
+                                .width(90.0)
+                                .selected_text(opts[state.1])
+                                .show_ui(ui, |ui| {
+                                    for (i, label) in opts.iter().enumerate() {
+                                        ui.selectable_value(&mut state.1, i, *label);
+                                    }
+                                });
+                        });
+                        ui.add_space(4.0);
+                    }
+
+                    let any_selected = self.glyph_absorption.0
+                        || self.glyph_attunement.0
+                        || self.glyph_unknown.0
+                        || self.glyph_witnessed.0;
+                    let btn = egui::Button::new(
+                        RichText::new("🖨 Print")
+                            .color(egui::Color32::from_rgb(80, 200, 120))
+                            .strong(),
+                    );
+                    if ui.add_enabled(!self.job_busy && any_selected, btn).clicked() {
+                        let mut args = Vec::new();
+                        if self.glyph_absorption.0 {
+                            args.push("--absorption".into());
+                            args.push(ABSORPTION_OPTS[self.glyph_absorption.1].into());
+                        }
+                        if self.glyph_attunement.0 {
+                            args.push("--attunement".into());
+                            args.push(ATTUNEMENT_OPTS[self.glyph_attunement.1].into());
+                        }
+                        if self.glyph_unknown.0 {
+                            args.push("--unknown".into());
+                            args.push(UNKNOWN_OPTS[self.glyph_unknown.1].into());
+                        }
+                        if self.glyph_witnessed.0 {
+                            args.push("--witnessed".into());
+                            args.push(WITNESSED_OPTS[self.glyph_witnessed.1].into());
+                        }
+                        print_args = Some(args);
+                    }
+                });
+            }
+            if let Some(args) = print_args {
+                self.spawn_print_glyph(args);
             }
 
             // ── Job log ──
@@ -989,6 +1114,13 @@ impl EegViewerApp {
                             st.recon_frame_count,
                         ));
                     }
+                    if st.recon_snapshots_fed > 0 {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 200, 120),
+                            format!("Analysis: {} snapshots", st.recon_snapshots_fed),
+                        );
+                    }
                 } else {
                     ui.label("No device selected");
                 }
@@ -999,16 +1131,25 @@ impl EegViewerApp {
         if self.viz_mode == VizMode::NeuralAura
             && self.active_tab < self.connected_devices.len()
         {
-            let analysis = self.connected_devices[self.active_tab]
-                .state
-                .lock()
-                .unwrap()
-                .analysis
-                .clone();
+            let (analysis, inference_status) = {
+                let st = self.connected_devices[self.active_tab]
+                    .state
+                    .lock()
+                    .unwrap();
+                let srv = self.server_state.lock().unwrap();
+                (
+                    st.analysis.clone(),
+                    viz_aura::InferenceStatus {
+                        server_connected: srv.connected,
+                        recon_frame_count: st.recon_frame_count,
+                        recon_snapshots_fed: st.recon_snapshots_fed,
+                    },
+                )
+            };
             egui::SidePanel::right("neural_aura_panel")
-                .exact_width(280.0)
+                .exact_width(300.0)
                 .show(ctx, |ui| {
-                    viz_aura::render_neural_aura(ui, &analysis.dimensions);
+                    viz_aura::render_neural_aura(ui, &analysis.dimensions, &inference_status);
                 });
         }
 
@@ -1333,13 +1474,13 @@ impl EegViewerApp {
 fn render_dimension_controls(
     ui: &mut egui::Ui,
     analysis: &AnalysisFrame,
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<PipelineCommand>,
+    cmds: &mut Vec<PipelineCommand>,
 ) {
     // Baseline button
     match analysis.baseline_state() {
         BaselineState::NotCollected | BaselineState::Failed(_) => {
             if ui.button("Start Baseline").clicked() {
-                let _ = cmd_tx.send(PipelineCommand::StartBaseline);
+                cmds.push(PipelineCommand::StartBaseline);
             }
         }
         BaselineState::Collecting { progress } => {
@@ -1347,7 +1488,7 @@ fn render_dimension_controls(
                 .button(format!("Stop Baseline ({:.0}%)", progress * 100.0))
                 .clicked()
             {
-                let _ = cmd_tx.send(PipelineCommand::StopBaseline);
+                cmds.push(PipelineCommand::StopBaseline);
             }
         }
         BaselineState::Collected => {
@@ -1401,7 +1542,7 @@ fn render_dimension_controls(
             DimensionReading::Idle => {
                 let btn = egui::Button::new(format!("Start {name}"));
                 if ui.add_enabled(enabled, btn).clicked() {
-                    let _ = cmd_tx.send(*start_cmd);
+                    cmds.push(*start_cmd);
                 }
             }
             DimensionReading::Settling { progress }
@@ -1410,7 +1551,7 @@ fn render_dimension_controls(
                     .button(format!("Stop {name} ({:.0}%)", progress * 100.0))
                     .clicked()
                 {
-                    let _ = cmd_tx.send(*stop_cmd);
+                    cmds.push(*stop_cmd);
                 }
             }
             DimensionReading::Complete(_) => {
@@ -1418,6 +1559,45 @@ fn render_dimension_controls(
             }
         }
     }
+}
+
+/// Map completed dimension readings to Python CLI arguments for print_glyph.
+/// Returns None if any dimension is not yet Complete.
+fn glyph_cli_args(analysis: &AnalysisFrame) -> Option<Vec<String>> {
+    let absorption = match &analysis.dimensions[0].reading {
+        DimensionReading::Complete(v) => match v.label {
+            "Deep" => "deep",
+            _ => "surface",
+        },
+        _ => return None,
+    };
+    let attunement = match &analysis.dimensions[1].reading {
+        DimensionReading::Complete(v) => match v.label {
+            "Porous" => "porous",
+            _ => "boundaried",
+        },
+        _ => return None,
+    };
+    let unknown = match &analysis.dimensions[2].reading {
+        DimensionReading::Complete(v) => match v.label {
+            "Lean" => "lean_in",
+            _ => "hold_back",
+        },
+        _ => return None,
+    };
+    let witnessed = match &analysis.dimensions[3].reading {
+        DimensionReading::Complete(v) => match v.label {
+            "Lean" => "approach",
+            _ => "withdraw",
+        },
+        _ => return None,
+    };
+    Some(vec![
+        "--absorption".into(), absorption.into(),
+        "--attunement".into(), attunement.into(),
+        "--unknown".into(), unknown.into(),
+        "--witnessed".into(), witnessed.into(),
+    ])
 }
 
 fn format_duration(d: Duration) -> String {
@@ -1740,6 +1920,7 @@ fn main() -> eframe::Result<()> {
     let server_state = Arc::new(Mutex::new(ServerState::default()));
     let zuna_dir = args.zuna_dir.clone();
     let muse_record_bin = args.muse_record_bin.clone();
+    let print_glyph_dir = args.print_glyph_dir.clone();
     let server_addr = args.server.clone();
     let simulate = args.simulate;
 
@@ -1774,9 +1955,15 @@ fn main() -> eframe::Result<()> {
                 job_last_duration: None,
                 pipeline_step: None,
                 pipeline_label: String::new(),
+                glyph_absorption: (true, 0),
+                glyph_attunement: (true, 0),
+                glyph_unknown: (true, 0),
+                glyph_witnessed: (true, 0),
                 max_points,
                 input_kind,
                 tokio_rt,
+                print_glyph_dir,
+                simulate,
                 legacy_state,
                 muse_status,
                 resume_muse_pending: false,

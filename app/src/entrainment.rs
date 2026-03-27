@@ -27,8 +27,6 @@
 //!
 //! Default threshold: 1.5.  Adjustable at runtime.
 
-use std::time::Instant;
-
 use crate::act::{ActConfig, ActEngine, Chirplet, TransformOpts};
 use crate::alpha::NUM_CH;
 use crate::compute::ContactQuality;
@@ -36,6 +34,8 @@ use crate::compute::ContactQuality;
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Tuneable parameters for the entrainment measurement.
+///
+/// Data-driven: uses window counts instead of wall-clock durations.
 #[derive(Debug, Clone)]
 pub struct EntrainmentConfig {
     /// Beat frequency in Hz (stimulus frequency to detect).
@@ -44,10 +44,10 @@ pub struct EntrainmentConfig {
     pub fc_tolerance_hz: f64,
     /// SNR threshold above which entrainment is classified as "Porous".
     pub snr_threshold: f64,
-    /// Total measurement duration in seconds.
-    pub measurement_duration_s: f64,
-    /// Initial settling period (discarded) in seconds.
-    pub settling_duration_s: f64,
+    /// Windows to discard during settling.
+    pub settling_windows: usize,
+    /// Windows to accumulate during measuring.
+    pub measuring_windows: usize,
 }
 
 impl Default for EntrainmentConfig {
@@ -56,16 +56,16 @@ impl Default for EntrainmentConfig {
             beat_freq_hz: 2.0,
             fc_tolerance_hz: 0.5,
             snr_threshold: 1.5,
-            measurement_duration_s: 45.0,
-            settling_duration_s: 5.0,
+            settling_windows: 20,  // ~5 s at 4 hops/s
+            measuring_windows: 160, // ~40 s at 4 hops/s
         }
     }
 }
 
 impl EntrainmentConfig {
-    /// Effective recording duration (total minus settling).
-    pub fn recording_duration_s(&self) -> f64 {
-        self.measurement_duration_s - self.settling_duration_s
+    /// Total windows required (settling + measuring).
+    pub fn total_windows(&self) -> usize {
+        self.settling_windows + self.measuring_windows
     }
 }
 
@@ -229,8 +229,8 @@ pub struct EntrainmentResult {
     pub per_channel_total_energy: [f64; NUM_CH],
     /// Overall artifact ratio (worst channel).
     pub artifact_ratio: f64,
-    /// Effective recording duration (seconds).
-    pub recording_duration_s: f64,
+    /// Total measuring windows accumulated.
+    pub measuring_windows: usize,
     /// Total clean windows across all channels.
     pub total_clean_windows: usize,
 }
@@ -238,11 +238,16 @@ pub struct EntrainmentResult {
 // ── Detector ─────────────────────────────────────────────────────────────────
 
 /// State machine that measures neural entrainment using a dedicated ACT engine.
+///
+/// Data-driven: phases transition based on window counts, not wall-clock.
 pub struct EntrainmentDetector {
     pub config: EntrainmentConfig,
     pub dict_config: EntrainmentDictConfig,
     pub phase: EntrainmentPhase,
-    start_time: Option<Instant>,
+    /// Windows received during settling (discarded).
+    settling_count: usize,
+    /// Windows received during measuring.
+    measuring_count: usize,
     /// Dedicated ACT engine for entrainment (created on start).
     engine: Option<ActEngine>,
     /// Transform options (derived from dict_config).
@@ -275,7 +280,8 @@ impl Default for EntrainmentDetector {
             config: EntrainmentConfig::default(),
             dict_config,
             phase: EntrainmentPhase::Idle,
-            start_time: None,
+            settling_count: 0,
+            measuring_count: 0,
             engine: None,
             opts,
             channels: std::array::from_fn(|_| ChannelAccum::default()),
@@ -295,7 +301,8 @@ impl EntrainmentDetector {
         self.opts = self.dict_config.to_transform_opts();
         self.engine = Some(engine);
         self.phase = EntrainmentPhase::Settling;
-        self.start_time = Some(Instant::now());
+        self.settling_count = 0;
+        self.measuring_count = 0;
         for ch in &mut self.channels {
             ch.reset();
         }
@@ -306,7 +313,6 @@ impl EntrainmentDetector {
     /// Stop measurement and return to Idle.
     pub fn stop(&mut self) {
         self.phase = EntrainmentPhase::Idle;
-        self.start_time = None;
         self.engine = None; // release engine
     }
 
@@ -315,25 +321,14 @@ impl EntrainmentDetector {
         matches!(self.phase, EntrainmentPhase::Settling | EntrainmentPhase::Measuring)
     }
 
-    /// Seconds elapsed since start.
-    pub fn elapsed_s(&self) -> f64 {
-        self.start_time
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0)
-    }
-
-    /// Seconds elapsed in the measuring phase specifically.
-    pub fn measuring_elapsed_s(&self) -> f64 {
-        (self.elapsed_s() - self.config.settling_duration_s).max(0.0)
-    }
-
     /// Overall progress fraction (0.0–1.0).
     pub fn progress(&self) -> f64 {
-        let total = self.config.measurement_duration_s;
-        if total <= 0.0 {
+        let total = self.config.total_windows();
+        if total == 0 {
             return 1.0;
         }
-        (self.elapsed_s() / total).clamp(0.0, 1.0)
+        let done = self.settling_count + self.measuring_count;
+        (done as f64 / total as f64).clamp(0.0, 1.0)
     }
 
     /// Feed filtered EEG windows (one per channel) from the signal pipeline.
@@ -345,12 +340,11 @@ impl EntrainmentDetector {
         epoch_ok: &[bool; NUM_CH],
         contact: &[ContactQuality; NUM_CH],
     ) {
-        let elapsed = self.elapsed_s();
-
         match self.phase {
             EntrainmentPhase::Idle | EntrainmentPhase::Complete => return,
             EntrainmentPhase::Settling => {
-                if elapsed >= self.config.settling_duration_s {
+                self.settling_count += 1;
+                if self.settling_count >= self.config.settling_windows {
                     self.phase = EntrainmentPhase::Measuring;
                 } else {
                     return;
@@ -360,6 +354,7 @@ impl EntrainmentDetector {
         }
 
         // Run the dedicated ACT engine
+        self.measuring_count += 1;
         let engine = match &self.engine {
             Some(e) => e,
             None => return,
@@ -403,7 +398,7 @@ impl EntrainmentDetector {
         }
 
         // Check completion
-        if elapsed >= self.config.measurement_duration_s {
+        if self.measuring_count >= self.config.measuring_windows {
             self.finish();
         }
     }
@@ -481,7 +476,7 @@ impl EntrainmentDetector {
             per_channel_beat_energy,
             per_channel_total_energy,
             artifact_ratio: worst_artifact,
-            recording_duration_s: self.measuring_elapsed_s(),
+            measuring_windows: self.measuring_count,
             total_clean_windows: total_clean,
         });
 

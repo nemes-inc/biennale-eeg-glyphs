@@ -17,7 +17,7 @@ use crate::device_state::{
     build_eegm_frame, chunk_ready, drain_chunk, DeviceState, HeadbandId, SessionWriter,
     SharedOutboundTx,
 };
-use crate::signal_pipeline::{ChannelId, PipelineCommand, SignalPipeline};
+use crate::signal_pipeline::PipelineCommand;
 
 /// Samples to accumulate before flushing to shared state.
 const CHUNK: usize = 256;
@@ -165,7 +165,6 @@ async fn run_device_ble_loop(
 
     let mut channel_accum: Vec<Vec<f32>> = vec![Vec::new(); CHANNELS];
     let mut epoch_seq: u32 = 0;
-    let mut pipeline = SignalPipeline::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -178,18 +177,7 @@ async fn run_device_ble_loop(
 
                 match evt {
                     MuseEvent::Eeg(r) if (r.electrode as usize) < CHANNELS => {
-                        // Feed signal pipeline with original f64 samples
-                        if let Some(ch) = ChannelId::new(r.electrode as usize) {
-                            pipeline.ingest_samples(ch, &r.samples);
-                            // Run analysis on TP9 to avoid multi-channel double-trigger
-                            if ch == ChannelId::TP9 {
-                                if let Some(frame) = pipeline.try_analyze() {
-                                    state.lock().unwrap().analysis = frame;
-                                }
-                            }
-                        }
-
-                        // Existing EEGM frame path, casts to f32 independently
+                        // Accumulate samples for EEGM framing (sent to inference server)
                         channel_accum[r.electrode as usize]
                             .extend(r.samples.iter().map(|&s| s as f32));
 
@@ -243,11 +231,10 @@ async fn run_device_ble_loop(
                     _ => {}
                 }
             }
-            // Pipeline commands from UI thread
-            Some(cmd) = cmd_rx.recv() => {
-                if let Err(reason) = pipeline.execute_command(cmd) {
-                    warn!("Pipeline command rejected: {reason}");
-                }
+            // Pipeline commands — now handled by DeviceState's inference pipeline
+            // but we still drain the channel to avoid backpressure
+            Some(_cmd) = cmd_rx.recv() => {
+                // Commands are now executed directly on DeviceState by the UI thread
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if stop.load(Ordering::SeqCst) {
