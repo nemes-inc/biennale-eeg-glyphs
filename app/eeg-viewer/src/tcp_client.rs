@@ -196,8 +196,14 @@ pub fn spawn_tcp_client(
                         let map = device_map_recv.lock().unwrap();
                         if let Some(state) = map.get(&frame.headband_id) {
                             let ts = frame.timestamp_us;
+                            let mut st = state.lock().unwrap();
+                            if let Some(ref mut sw) = st.session_recon_writer {
+                                if let Err(e) = sw.append_frame(&frame) {
+                                    log::warn!("Session recon write: {e}");
+                                }
+                            }
                             let channels = extract_channels_from_frame(&frame);
-                            state.lock().unwrap().push_reconstructed_frame(channels, ts);
+                            st.push_reconstructed_frame(channels, ts);
                         } else if recv_count <= 5 {
                             warn!(
                                 "No device for headband_id={}, known ids: {:?}",

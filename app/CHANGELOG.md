@@ -1,3 +1,13 @@
+# v0.7.0
+
+## March 27, 2026
+
+## Session management
+
+Start/End Session controls in the toolbar. Auto-names sessions as `session_1`, `session_2`, etc. by scanning existing folders. Each session creates a directory under `sessions/` containing per-device `_raw.eegm` and `_recon.eegm` files — both raw BLE frames and reconstructed inference data persisted in EEGM binary format. Devices connecting mid-session get session writers opened automatically. Existing WAL files for reconnect replay continue independently.
+
+---
+
 # v0.6.0
 
 ## March 27, 2026

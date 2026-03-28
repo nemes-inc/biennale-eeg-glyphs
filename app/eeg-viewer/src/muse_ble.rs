@@ -191,28 +191,33 @@ async fn run_device_ble_loop(
                                 .unwrap_or(0);
                             let eegm = build_eegm_frame(headband_id, epoch_seq, &frame, timestamp_us);
 
-                            // Write-ahead: persist to session file FIRST
+                            // Write-ahead: persist to WAL FIRST (outside lock)
                             if let Some(ref mut sw) = session_writer {
                                 if let Err(e) = sw.append_frame(&eegm) {
                                     warn!("Session write failed: {e}");
                                 }
                             }
 
-                            // Then send to inference server
-                            let sent = outbound_tx.send(eegm);
-                            if epoch_seq < 3 || epoch_seq % 100 == 0 {
-                                info!("BLE outbound send seq={epoch_seq} sent={sent}");
-                            }
-                            epoch_seq = epoch_seq.wrapping_add(1);
-
-                            // Update shared state for UI and counters
+                            // Update state + session raw write (one lock, eegm still alive)
                             {
                                 let mut st = state.lock().unwrap();
+                                if let Some(ref mut sw) = st.session_raw_writer {
+                                    if let Err(e) = sw.append_frame(&eegm) {
+                                        warn!("Session raw write: {e}");
+                                    }
+                                }
                                 st.push_raw_frame(frame, timestamp_us);
                                 if let Some(ref sw) = session_writer {
                                     st.session_frames_written = sw.frames_written();
                                 }
                             }
+
+                            // Send to inference server (after lock, consumes eegm)
+                            let sent = outbound_tx.send(eegm);
+                            if epoch_seq < 3 || epoch_seq % 100 == 0 {
+                                info!("BLE outbound send seq={epoch_seq} sent={sent}");
+                            }
+                            epoch_seq = epoch_seq.wrapping_add(1);
                         }
                     }
                     MuseEvent::Connected(name) => {

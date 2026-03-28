@@ -10,6 +10,7 @@ Multi-Muse EEG viewer with per-device recording and real-time ZUNA inference ove
 - Records independently per device to FIF files
 - Streams raw EEG to a Python inference server over TCP using the EEGM binary protocol
 - Overlays reconstructed (ZUNA-inferred) EEG at the correct time position on the original trace
+- **Session management** — start/end named sessions that capture both raw and reconstructed EEGM data per device into organized folders
 - Every outbound frame is write-ahead logged to a per-device session file before entering the TCP path
 - On server reconnect, replays unsent frames automatically from the session file offset
 - `--simulate` mode for full UI testing without hardware
@@ -140,6 +141,27 @@ graph TD
    classDef storage fill:#f3e5f5
    classDef compute fill:#fce4ec
    classDef orch fill:#e8f5e9
+```
+
+### Session management
+
+Named sessions group raw and reconstructed data per device into a single folder. The toolbar shows a session name text field (auto-populated as `session_1`, `session_2`, etc.) and Start/End buttons.
+
+- **Start Session** creates `{zuna_dir}/sessions/{name}/`, opens `{device}_raw.eegm` and `{device}_recon.eegm` writers for each connected device
+- Raw EEGM frames written inside the BLE task's DeviceState lock, alongside the existing WAL write
+- Reconstructed EEGM frames written inside the TCP recv task's DeviceState lock, before `push_reconstructed_frame`
+- **End Session** closes all session writers, resets the name input to the next available number
+- Devices connecting mid-session automatically get session writers opened
+- The existing WAL at `sessions/{device}_{ts}.eegm` continues independently for reconnect replay
+
+```text
+{zuna_dir}/sessions/
+  Muse-AB12_1234567890.eegm      # WAL (always, unchanged)
+  session_1/
+    Muse-AB12_raw.eegm            # raw BLE frames during session
+    Muse-AB12_recon.eegm          # reconstructed frames during session
+  session_2/
+    ...
 ```
 
 ### Analysis hop rate

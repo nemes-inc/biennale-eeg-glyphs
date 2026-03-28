@@ -31,8 +31,8 @@ use egui::RichText;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use device_state::{
-    clamp_tab_index, device_fif_path, next_available_headband_id, session_file_path,
-    ConnectedDevice, DeviceState, ServerState, SharedOutboundTx,
+    clamp_tab_index, device_fif_path, next_available_headband_id, next_session_name,
+    session_file_path, ConnectedDevice, DeviceState, ServerState, SharedOutboundTx,
 };
 use muse_ble::ScanResult;
 use signal_pipeline::{
@@ -212,6 +212,11 @@ struct EegViewerApp {
     // ── Dimension settings ──
     all_devices_mode: bool,
     show_dimension_settings: bool,
+
+    // ── Session management ──
+    session_name: Option<String>,
+    session_dir: Option<PathBuf>,
+    session_name_input: String,
 
     // ── Legacy single-device state (stdin/TCP modes) ──
     legacy_state: Option<Arc<Mutex<SharedState>>>,
@@ -439,6 +444,15 @@ impl EegViewerApp {
             glyph_selections: [(true, 0); 4],
         });
 
+        // Open session writers if a session is active
+        if let Some(ref dir) = self.session_dir {
+            let device = self.connected_devices.last().unwrap();
+            let mut st = device.state.lock().unwrap();
+            if let Err(e) = st.start_session_writers(dir, &device.device_name) {
+                log::warn!("Session writer for new device: {e}");
+            }
+        }
+
         self.active_tab = self.connected_devices.len() - 1;
     }
 
@@ -587,6 +601,35 @@ impl EegViewerApp {
         });
 
         self.active_tab = 0;
+    }
+
+    fn start_session(&mut self) {
+        let name = self.session_name_input.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let dir = self.zuna_dir.join("sessions").join(&name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.job_log = format!("Session dir failed: {e}");
+            return;
+        }
+        for device in &self.connected_devices {
+            let mut st = device.state.lock().unwrap();
+            if let Err(e) = st.start_session_writers(&dir, &device.device_name) {
+                log::warn!("Session writer failed for {}: {e}", device.device_name);
+            }
+        }
+        self.session_name = Some(name);
+        self.session_dir = Some(dir);
+    }
+
+    fn stop_session(&mut self) {
+        for device in &self.connected_devices {
+            device.state.lock().unwrap().stop_session_writers();
+        }
+        self.session_name = None;
+        self.session_dir = None;
+        self.session_name_input = next_session_name(&self.zuna_dir);
     }
 
     fn connect_to_server(&mut self) {
@@ -1221,6 +1264,35 @@ impl EegViewerApp {
                             self.connected_devices[self.active_tab].tab_color_idx =
                                 ((color_idx + 1) % TAB_COLORS.len()) as u8;
                         }
+                    }
+                }
+            });
+
+            // ── Session controls ──
+            ui.horizontal(|ui| {
+                if let Some(ref name) = self.session_name {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(80, 200, 120),
+                        format!("Session: {name}"),
+                    );
+                    if ui.button("End Session").clicked() {
+                        self.stop_session();
+                    }
+                } else {
+                    ui.label("Session:");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.session_name_input)
+                            .desired_width(120.0),
+                    );
+                    let can_start = !self.session_name_input.trim().is_empty();
+                    if ui
+                        .add_enabled(can_start, egui::Button::new("Start Session"))
+                        .clicked()
+                        || (response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && can_start)
+                    {
+                        self.start_session();
                     }
                 }
             });
@@ -2220,6 +2292,7 @@ fn main() -> eframe::Result<()> {
 
     let server_state = Arc::new(Mutex::new(ServerState::default()));
     let zuna_dir = args.zuna_dir.clone();
+    let initial_session_name = next_session_name(&zuna_dir);
     let muse_record_bin = args.muse_record_bin.clone();
     let print_glyph_dir = args.print_glyph_dir.clone();
     let server_addr = args.server.clone();
@@ -2267,6 +2340,9 @@ fn main() -> eframe::Result<()> {
                 device_color_config: DeviceColorConfig::load(),
                 all_devices_mode: false,
                 show_dimension_settings: false,
+                session_name: None,
+                session_dir: None,
+                session_name_input: initial_session_name,
                 resume_muse_pending: false,
                 reset_confirm_pending: false,
             };

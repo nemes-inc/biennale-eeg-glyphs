@@ -112,6 +112,10 @@ pub struct DeviceState {
 
     /// Number of reconstructed snapshots fed to the inference pipeline.
     pub recon_snapshots_fed: u64,
+
+    /// Per-device session writers. Set by UI thread, used by BLE/TCP tasks.
+    pub session_raw_writer: Option<SessionWriter>,
+    pub session_recon_writer: Option<SessionWriter>,
 }
 
 impl DeviceState {
@@ -135,6 +139,8 @@ impl DeviceState {
             analysis: AnalysisFrame::default(),
             inference_pipeline: SignalPipeline::new_for_reconstructed(),
             recon_snapshots_fed: 0,
+            session_raw_writer: None,
+            session_recon_writer: None,
         }
     }
 
@@ -274,6 +280,24 @@ impl DeviceState {
         self.record_buffer.clear();
         self.record_sample_count = 0;
     }
+
+    /// Open session writers for raw and reconstructed data in the given directory.
+    pub fn start_session_writers(&mut self, session_dir: &Path, device_label: &str) -> io::Result<()> {
+        let safe = device_label.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
+        self.session_raw_writer = Some(SessionWriter::create(
+            &session_dir.join(format!("{safe}_raw.eegm")),
+        )?);
+        self.session_recon_writer = Some(SessionWriter::create(
+            &session_dir.join(format!("{safe}_recon.eegm")),
+        )?);
+        Ok(())
+    }
+
+    /// Close session writers, flushing files.
+    pub fn stop_session_writers(&mut self) {
+        self.session_raw_writer = None;
+        self.session_recon_writer = None;
+    }
 }
 
 // ── ServerState ──────────────────────────────────────────────────────────────
@@ -294,6 +318,26 @@ impl Default for ServerState {
 }
 
 // ── SessionWriter ────────────────────────────────────────────────────────────
+
+/// Auto-generate next session name by scanning existing `session_N` directories.
+pub fn next_session_name(base_dir: &Path) -> String {
+    let sessions_dir = base_dir.join("sessions");
+    let mut max_n = 0u32;
+    if let Ok(entries) = fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map_or(false, |t| t.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(n_str) = name.strip_prefix("session_") {
+                        if let Ok(n) = n_str.parse::<u32>() {
+                            max_n = max_n.max(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    format!("session_{}", max_n + 1)
+}
 
 /// Generate session file path: `{base_dir}/sessions/{safe_name}_{timestamp}.eegm`
 pub fn session_file_path(base_dir: &Path, device_name: &str) -> PathBuf {
