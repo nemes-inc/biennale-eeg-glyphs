@@ -74,18 +74,21 @@ fn main() {
             .std("c++17")
             .opt_level(3)
             .include(format!("{act_lib}/include"))
-            .include(format!("{act_lib}/lib"))
             .warnings(false); // suppress ALGLIB sprintf deprecation warnings
 
         let is_macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
         if is_macos {
+            // System includes BEFORE bundled lib/ so system MLX headers
+            // match the installed libmlx dylib (bundled headers may be newer).
             build
                 .define("USE_MLX", None)
                 .define("ACCELERATE_NEW_LAPACK", None)
-                .include(format!("{act_lib}/lib/mlx"))
                 .include("/usr/local/include")
                 .include("/opt/homebrew/include");
         }
+
+        // Bundled lib/ (ALGLIB etc.) after system includes
+        build.include(format!("{act_lib}/lib"));
 
         for src in &act_sources {
             build.file(src);
