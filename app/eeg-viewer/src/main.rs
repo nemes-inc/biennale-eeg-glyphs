@@ -164,6 +164,8 @@ struct EegViewerApp {
     scan_active: bool,
     scan_rx: Option<std::sync::mpsc::Receiver<Result<Vec<ScanResult>, String>>>,
     show_device_picker: bool,
+    /// Device index awaiting BLE reconnect. When set, poll_scan() auto-connects.
+    reconnect_target: Option<usize>,
 
     // ── Inference server ──
     server_state: Arc<Mutex<ServerState>>,
@@ -210,6 +212,9 @@ struct EegViewerApp {
     #[allow(dead_code)]
     simulate: bool,
 
+    // ── Device color config ──
+    device_color_config: DeviceColorConfig,
+
     // ── Legacy single-device state (stdin/TCP modes) ──
     legacy_state: Option<Arc<Mutex<SharedState>>>,
     muse_status: String,
@@ -222,10 +227,81 @@ struct EegViewerApp {
 const COLOR_ORIGINAL: egui::Color32 = egui::Color32::from_rgb(0, 128, 255);
 const COLOR_RECONSTRUCTED: egui::Color32 = egui::Color32::from_rgb(255, 48, 48);
 
-const ABSORPTION_OPTS: [&str; 2] = ["deep", "surface"];
-const ATTUNEMENT_OPTS: [&str; 2] = ["porous", "boundaried"];
-const UNKNOWN_OPTS: [&str; 2] = ["lean_in", "hold_back"];
-const WITNESSED_OPTS: [&str; 2] = ["approach", "withdraw"];
+const TAB_COLORS: &[(&str, egui::Color32)] = &[
+    ("blue", egui::Color32::from_rgb(0, 128, 255)),
+    ("red", egui::Color32::from_rgb(220, 40, 40)),
+    ("black", egui::Color32::from_rgb(30, 30, 30)),
+    ("green", egui::Color32::from_rgb(40, 180, 60)),
+    ("white", egui::Color32::from_rgb(220, 220, 220)),
+];
+const TAB_COLOR_BLINK: egui::Color32 = egui::Color32::from_rgb(255, 0, 0);
+
+/// Loaded from devices.json: maps device ID suffix to a color name.
+struct DeviceColorConfig {
+    entries: Vec<(String, u8)>, // (id_suffix_lowercase, color_index)
+}
+
+impl DeviceColorConfig {
+    fn load() -> Self {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("devices.json");
+        let mut entries = Vec::new();
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            // Minimal JSON parsing without serde: extract id_suffix and color fields
+            if let Some(devices_start) = contents.find("\"devices\"") {
+                let rest = &contents[devices_start..];
+                // Find each object with id_suffix and color
+                let mut pos = 0;
+                while let Some(obj_start) = rest[pos..].find('{') {
+                    let obj_start = pos + obj_start;
+                    let Some(obj_end) = rest[obj_start..].find('}') else { break };
+                    let obj = &rest[obj_start..obj_start + obj_end + 1];
+
+                    let suffix = Self::extract_str(obj, "id_suffix");
+                    let color = Self::extract_str(obj, "color");
+
+                    if let (Some(suffix), Some(color)) = (suffix, color) {
+                        let color_idx = TAB_COLORS
+                            .iter()
+                            .position(|(name, _)| *name == color)
+                            .unwrap_or(0) as u8;
+                        entries.push((suffix.to_lowercase(), color_idx));
+                    }
+                    pos = obj_start + obj_end + 1;
+                }
+            }
+        }
+        Self { entries }
+    }
+
+    fn extract_str<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
+        let pattern = format!("\"{}\"", key);
+        let key_pos = obj.find(&pattern)?;
+        let after_key = &obj[key_pos + pattern.len()..];
+        let colon = after_key.find(':')?;
+        let after_colon = after_key[colon + 1..].trim_start();
+        if !after_colon.starts_with('"') { return None; }
+        let val_start = 1;
+        let val_end = after_colon[val_start..].find('"')?;
+        Some(&after_colon[val_start..val_start + val_end])
+    }
+
+    fn color_for_device(&self, device_id: &str) -> Option<u8> {
+        let id_lower = device_id.to_lowercase();
+        self.entries.iter().find_map(|(suffix, idx)| {
+            if id_lower.contains(suffix.as_str()) { Some(*idx) } else { None }
+        })
+    }
+}
+
+const ABSORPTION_OPTS: [&str; 2] = ["Deep", "Surface"];
+const ATTUNEMENT_OPTS: [&str; 2] = ["Porous", "Boundaried"];
+const UNKNOWN_OPTS: [&str; 2] = ["Lean In", "Hold Back"];
+const WITNESSED_OPTS: [&str; 2] = ["Approach", "Withdraw"];
+
+const ABSORPTION_CLI: [&str; 2] = ["deep", "surface"];
+const ATTUNEMENT_CLI: [&str; 2] = ["porous", "boundaried"];
+const UNKNOWN_CLI: [&str; 2] = ["lean_in", "hold_back"];
+const WITNESSED_CLI: [&str; 2] = ["approach", "withdraw"];
 
 fn resolve_input_kind(args: &Args) -> InputKind {
     if args.tcp.is_some() {
@@ -259,17 +335,34 @@ impl EegViewerApp {
                 self.scan_results = results;
                 self.scan_active = false;
                 self.scan_rx = None;
-                self.show_device_picker = true;
+
+                // Auto-reconnect: match by device_id if a reconnect is pending
+                if let Some(target_idx) = self.reconnect_target.take() {
+                    if target_idx < self.connected_devices.len() {
+                        let target_id = self.connected_devices[target_idx].device_id.clone();
+                        if let Some(pos) = self.scan_results.iter().position(|sr| sr.device.id == target_id) {
+                            let sr = self.scan_results.remove(pos);
+                            self.do_reconnect(target_idx, sr);
+                        } else {
+                            self.muse_status = "Reconnect: device not found in scan".to_string();
+                            self.show_device_picker = true;
+                        }
+                    }
+                } else {
+                    self.show_device_picker = true;
+                }
             }
             Ok(Err(err)) => {
                 self.muse_status = err;
                 self.scan_active = false;
                 self.scan_rx = None;
+                self.reconnect_target = None;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.scan_active = false;
                 self.scan_rx = None;
+                self.reconnect_target = None;
             }
         }
     }
@@ -324,6 +417,11 @@ impl EegViewerApp {
             .unwrap()
             .insert(headband_id.as_u32(), Arc::clone(&state));
 
+        let color_idx = self
+            .device_color_config
+            .color_for_device(&display_label)
+            .or_else(|| self.device_color_config.color_for_device(&device_id))
+            .unwrap_or((self.connected_devices.len() % TAB_COLORS.len()) as u8);
         self.connected_devices.push(ConnectedDevice {
             device_name: display_label,
             device_id,
@@ -337,6 +435,9 @@ impl EegViewerApp {
             epoch_seq: 0,
             session_path: Some(sess_path),
             pipeline_cmd_tx: Some(cmd_tx),
+            tab_color_idx: color_idx,
+            disconnect_blink_until: None,
+            was_streaming: false,
         });
 
         self.active_tab = self.connected_devices.len() - 1;
@@ -353,6 +454,50 @@ impl EegViewerApp {
             .unwrap()
             .remove(&device.headband_id.as_u32());
         self.active_tab = clamp_tab_index(self.active_tab, self.connected_devices.len());
+    }
+
+    fn reconnect_device(&mut self, idx: usize) {
+        if idx >= self.connected_devices.len() || self.scan_active {
+            return;
+        }
+        let streaming = self.connected_devices[idx].state.lock().unwrap().streaming;
+        if streaming {
+            return;
+        }
+        self.reconnect_target = Some(idx);
+        self.start_scan();
+    }
+
+    fn do_reconnect(&mut self, device_idx: usize, scan_result: ScanResult) {
+        if device_idx >= self.connected_devices.len() {
+            return;
+        }
+        let device = &mut self.connected_devices[device_idx];
+
+        // Stop old BLE task
+        device.stop_flag.store(true, Ordering::SeqCst);
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let headband_id = device.headband_id;
+        let state = Arc::clone(&device.state);
+        let session_path = device.session_path.clone();
+
+        let ble_handle = muse_ble::spawn_device_ble_task(
+            scan_result.device,
+            headband_id,
+            state,
+            self.outbound_tx.clone(),
+            session_path,
+            cmd_rx,
+            &self.tokio_rt,
+        );
+
+        device.stop_flag = ble_handle.stop;
+        device.join_handle = Some(ble_handle.join);
+        device.pipeline_cmd_tx = Some(cmd_tx);
+        device.disconnect_blink_until = None;
+        device.was_streaming = false;
     }
 
     /// Spawn a simulated device that generates synthetic EEG data.
@@ -436,6 +581,9 @@ impl EegViewerApp {
             epoch_seq: 0,
             session_path: None,
             pipeline_cmd_tx: None,
+            tab_color_idx: 0,
+            disconnect_blink_until: None,
+            was_streaming: false,
         });
 
         self.active_tab = 0;
@@ -832,31 +980,84 @@ impl EegViewerApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             // ── Tab bar ──
             ui.horizontal(|ui| {
-                let mut tabs_to_render: Vec<(usize, String, bool, bool)> = Vec::new();
-                for (idx, device) in self.connected_devices.iter().enumerate() {
+                let now = Instant::now();
+
+                // Collect tab data and detect disconnect transitions
+                let mut tabs_to_render: Vec<(usize, String, bool, bool, u8, bool)> = Vec::new();
+                for (idx, device) in self.connected_devices.iter_mut().enumerate() {
                     let st = device.state.lock().unwrap();
+                    let streaming = st.streaming;
+                    let recording = st.recording_active;
+                    drop(st);
+
+                    // Detect disconnect transition
+                    if device.was_streaming && !streaming {
+                        device.disconnect_blink_until = Some(now + Duration::from_secs(5));
+                    }
+                    device.was_streaming = streaming;
+
+                    let blinking = device
+                        .disconnect_blink_until
+                        .map_or(false, |until| now < until);
+
                     tabs_to_render.push((
                         idx,
                         device.device_name.clone(),
-                        st.streaming,
-                        st.recording_active,
+                        streaming,
+                        recording,
+                        device.tab_color_idx,
+                        blinking,
                     ));
                 }
 
-                for (idx, name, streaming, recording) in &tabs_to_render {
-                    let dot = match (streaming, recording) {
-                        (_, true) => "R",
-                        (true, _) => "S",
-                        _ => "x",
+                for (idx, name, streaming, recording, color_idx, blinking) in &tabs_to_render {
+                    let base_color = TAB_COLORS[*color_idx as usize % TAB_COLORS.len()].1;
+                    let dot_color = if *blinking {
+                        // Alternate between base and red every 500ms
+                        let epoch_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        if (epoch_ms / 500) % 2 == 0 {
+                            TAB_COLOR_BLINK
+                        } else {
+                            base_color
+                        }
+                    } else {
+                        base_color
+                    };
+
+                    let suffix = match (streaming, recording) {
+                        (_, true) => " R",
+                        (false, _) => " x",
+                        _ => "",
                     };
                     let selected = *idx == self.active_tab;
-                    let label = format!("[{dot}] {name}");
-                    if ui
-                        .selectable_label(selected, &label)
-                        .clicked()
-                    {
-                        self.active_tab = *idx;
-                    }
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        // Painted circle with outline so all colors (including black) are visible
+                        let radius = 7.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(radius * 2.0 + 2.0, radius * 2.0 + 2.0),
+                            egui::Sense::hover(),
+                        );
+                        let center = rect.center();
+                        ui.painter().circle(
+                            center,
+                            radius,
+                            dot_color,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(180, 180, 180)),
+                        );
+                        if ui.selectable_label(selected, format!("{name}{suffix}")).clicked() {
+                            self.active_tab = *idx;
+                        }
+                    });
+                }
+
+                // Request repaint while any tab is blinking
+                if tabs_to_render.iter().any(|(_, _, _, _, _, blinking)| *blinking) {
+                    ctx.request_repaint();
                 }
 
                 ui.separator();
@@ -978,9 +1179,47 @@ impl EegViewerApp {
                         self.start_preprocess_for_device();
                     }
 
-                    // Disconnect button
-                    if ui.button("Disconnect").clicked() {
-                        self.disconnect_device(self.active_tab);
+                    ui.separator();
+
+                    // Connection status + actions
+                    if streaming {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 200, 120),
+                            "Connected",
+                        );
+                        if ui.button("Disconnect").clicked() {
+                            self.disconnect_device(self.active_tab);
+                        }
+                    } else if self.reconnect_target == Some(self.active_tab) {
+                        ui.spinner();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 0),
+                            "Reconnecting...",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 0),
+                            "Disconnected",
+                        );
+                        if ui.button("Reconnect").clicked() {
+                            self.reconnect_device(self.active_tab);
+                        }
+                        if ui.button("Remove").clicked() {
+                            self.disconnect_device(self.active_tab);
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Color picker — cycle through 4 colors
+                    let color_idx = self.connected_devices[self.active_tab].tab_color_idx as usize;
+                    let current_color = TAB_COLORS[color_idx % TAB_COLORS.len()].1;
+                    let color_btn = egui::Button::new(
+                        RichText::new("●").color(current_color).size(16.0),
+                    );
+                    if ui.add(color_btn).on_hover_text("Change tab color").clicked() {
+                        self.connected_devices[self.active_tab].tab_color_idx =
+                            ((color_idx + 1) % TAB_COLORS.len()) as u8;
                     }
                 }
             });
@@ -1011,7 +1250,18 @@ impl EegViewerApp {
             {
                 let analysis = {
                     let device = &self.connected_devices[self.active_tab];
-                    let analysis = device.state.lock().unwrap().analysis.clone();
+                    let (analysis, streaming) = {
+                        let st = device.state.lock().unwrap();
+                        (st.analysis.clone(), st.streaming)
+                    };
+
+                    // Auto-stop detectors stuck after BLE disconnect
+                    if !streaming && analysis.has_active_detectors() {
+                        log::info!("BLE disconnected — stopping all running detectors");
+                        let mut st = device.state.lock().unwrap();
+                        st.stop_all_detectors();
+                    }
+
                     let mut cmds = Vec::new();
                     ui.horizontal(|ui| {
                         render_dimension_controls(ui, &analysis, &mut cmds);
@@ -1074,19 +1324,19 @@ impl EegViewerApp {
                         let mut args = Vec::new();
                         if self.glyph_absorption.0 {
                             args.push("--absorption".into());
-                            args.push(ABSORPTION_OPTS[self.glyph_absorption.1].into());
+                            args.push(ABSORPTION_CLI[self.glyph_absorption.1].into());
                         }
                         if self.glyph_attunement.0 {
                             args.push("--attunement".into());
-                            args.push(ATTUNEMENT_OPTS[self.glyph_attunement.1].into());
+                            args.push(ATTUNEMENT_CLI[self.glyph_attunement.1].into());
                         }
                         if self.glyph_unknown.0 {
                             args.push("--unknown".into());
-                            args.push(UNKNOWN_OPTS[self.glyph_unknown.1].into());
+                            args.push(UNKNOWN_CLI[self.glyph_unknown.1].into());
                         }
                         if self.glyph_witnessed.0 {
                             args.push("--witnessed".into());
-                            args.push(WITNESSED_OPTS[self.glyph_witnessed.1].into());
+                            args.push(WITNESSED_CLI[self.glyph_witnessed.1].into());
                         }
                         print_args = Some(args);
                     }
@@ -1590,7 +1840,7 @@ fn render_dimension_controls(
 fn glyph_cli_args(analysis: &AnalysisFrame) -> Option<Vec<String>> {
     let absorption = match &analysis.dimensions[0].reading {
         DimensionReading::Complete(v) => match v.label {
-            "Rising" => "deep",
+            "Deep" => "deep",
             _ => "surface",
         },
         _ => return None,
@@ -1604,14 +1854,14 @@ fn glyph_cli_args(analysis: &AnalysisFrame) -> Option<Vec<String>> {
     };
     let unknown = match &analysis.dimensions[2].reading {
         DimensionReading::Complete(v) => match v.label {
-            "Lean" => "lean_in",
+            "Lean In" => "lean_in",
             _ => "hold_back",
         },
         _ => return None,
     };
     let witnessed = match &analysis.dimensions[3].reading {
         DimensionReading::Complete(v) => match v.label {
-            "Lean" => "approach",
+            "Approach" => "approach",
             _ => "withdraw",
         },
         _ => return None,
@@ -1959,6 +2209,7 @@ fn main() -> eframe::Result<()> {
                 scan_active: false,
                 scan_rx: None,
                 show_device_picker: false,
+                reconnect_target: None,
                 server_state,
                 server_addr,
                 outbound_tx: SharedOutboundTx::new(),
@@ -1990,6 +2241,7 @@ fn main() -> eframe::Result<()> {
                 simulate,
                 legacy_state,
                 muse_status,
+                device_color_config: DeviceColorConfig::load(),
                 resume_muse_pending: false,
                 reset_confirm_pending: false,
             };

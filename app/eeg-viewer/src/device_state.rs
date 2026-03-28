@@ -216,6 +216,12 @@ impl DeviceState {
         self.inference_pipeline.execute_command(cmd)
     }
 
+    /// Stop all running detectors. Called on BLE disconnect to prevent
+    /// detectors from being stuck in Settling/Measuring forever.
+    pub fn stop_all_detectors(&mut self) {
+        self.inference_pipeline.stop_all_detectors();
+    }
+
     /// Convert an absolute timestamp to seconds relative to stream start.
     fn relative_secs(&self, timestamp_us: u64) -> f64 {
         match self.stream_start_us {
@@ -399,6 +405,12 @@ pub struct ConnectedDevice {
     pub session_path: Option<PathBuf>,
     /// Send dimension analysis commands to the BLE pipeline.
     pub pipeline_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<PipelineCommand>>,
+    /// User-assigned tab color index (0=Blue, 1=Red, 2=Black, 3=Green).
+    pub tab_color_idx: u8,
+    /// Blink tab red until this instant after BLE disconnect.
+    pub disconnect_blink_until: Option<std::time::Instant>,
+    /// Previous streaming state for detecting disconnect transitions.
+    pub was_streaming: bool,
 }
 
 // ── Semantic functions (pure, testable) ──────────────────────────────────────
@@ -791,6 +803,9 @@ mod tests {
             epoch_seq: 0,
             session_path: None,
             pipeline_cmd_tx: None,
+            tab_color_idx: 0,
+            disconnect_blink_until: None,
+            was_streaming: false,
         }
     }
 

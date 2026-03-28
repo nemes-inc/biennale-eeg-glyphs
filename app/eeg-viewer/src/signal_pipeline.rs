@@ -200,6 +200,13 @@ impl Default for AnalysisFrame {
     }
 }
 
+impl AnalysisFrame {
+    /// True if any dimension detector is in Settling or Measuring.
+    pub fn has_active_detectors(&self) -> bool {
+        self.dimensions.iter().any(|d| d.reading.is_active())
+    }
+}
+
 // ── Pipeline Command ─────────────────────────────────────────────────────────
 
 /// Commands from UI thread to signal pipeline in BLE task.
@@ -233,9 +240,9 @@ fn extract_window(buf: &VecDeque<f64>, len: usize) -> Vec<f64> {
 /// Gauge range: -10 to +10 %/min, center at 0.5.
 fn trend_to_value(result: &muse_rs::alpha_trend::AlphaTrendResult) -> DimensionValue {
     let label = match result.label {
-        muse_rs::alpha_trend::TrendLabel::Rising => "Rising",
-        muse_rs::alpha_trend::TrendLabel::Flat => "Flat",
-        muse_rs::alpha_trend::TrendLabel::Falling => "Falling",
+        muse_rs::alpha_trend::TrendLabel::Rising => "Deep",
+        muse_rs::alpha_trend::TrendLabel::Flat => "Surface",
+        muse_rs::alpha_trend::TrendLabel::Falling => "Surface",
     };
     let fraction = ((result.trend_pct_per_min + 10.0) / 20.0).clamp(0.0, 1.0) as f32;
     DimensionValue {
@@ -261,13 +268,29 @@ fn entrainment_to_value(snr: f64, threshold: f64) -> DimensionValue {
     }
 }
 
-/// Map frontal asymmetry to a DimensionValue.
-/// Center gauge at 0.5, positive right, negative left.
-fn asymmetry_to_value(asymmetry: f64, deadband: f64) -> DimensionValue {
+/// Map frontal asymmetry to Unknown dimension value.
+fn asymmetry_to_unknown_value(asymmetry: f64, deadband: f64) -> DimensionValue {
     let label = if asymmetry > deadband {
-        "Lean"
+        "Lean In"
     } else if asymmetry < -deadband {
-        "Hold"
+        "Hold Back"
+    } else {
+        "Neutral"
+    };
+    let fraction = ((asymmetry + 0.5) / 1.0).clamp(0.0, 1.0) as f32;
+    DimensionValue {
+        label,
+        gauge_fraction: fraction,
+        display_text: format!("{asymmetry:+.3}"),
+    }
+}
+
+/// Map frontal asymmetry to Witnessed dimension value.
+fn asymmetry_to_witnessed_value(asymmetry: f64, deadband: f64) -> DimensionValue {
+    let label = if asymmetry > deadband {
+        "Approach"
+    } else if asymmetry < -deadband {
+        "Withdraw"
     } else {
         "Neutral"
     };
@@ -330,7 +353,7 @@ fn snapshot_entrainment(det: &EntrainmentDetector) -> DimensionReading {
     }
 }
 
-fn snapshot_approach(det: &ApproachDetector) -> DimensionReading {
+fn snapshot_unknown(det: &ApproachDetector) -> DimensionReading {
     match &det.phase {
         ApproachPhase::Idle => DimensionReading::Idle,
         ApproachPhase::Settling => DimensionReading::Settling {
@@ -340,12 +363,35 @@ fn snapshot_approach(det: &ApproachDetector) -> DimensionReading {
             progress: det.progress() as f32,
             live: det
                 .live_asymmetry()
-                .map(|a| asymmetry_to_value(a, det.config.deadband)),
+                .map(|a| asymmetry_to_unknown_value(a, det.config.deadband)),
             elapsed_s: None,
         },
         ApproachPhase::Complete => {
             let result = det.result.as_ref().unwrap();
-            DimensionReading::Complete(asymmetry_to_value(
+            DimensionReading::Complete(asymmetry_to_unknown_value(
+                result.asymmetry,
+                result.deadband,
+            ))
+        }
+    }
+}
+
+fn snapshot_witnessed(det: &ApproachDetector) -> DimensionReading {
+    match &det.phase {
+        ApproachPhase::Idle => DimensionReading::Idle,
+        ApproachPhase::Settling => DimensionReading::Settling {
+            progress: det.progress() as f32,
+        },
+        ApproachPhase::Measuring => DimensionReading::Measuring {
+            progress: det.progress() as f32,
+            live: det
+                .live_asymmetry()
+                .map(|a| asymmetry_to_witnessed_value(a, det.config.deadband)),
+            elapsed_s: None,
+        },
+        ApproachPhase::Complete => {
+            let result = det.result.as_ref().unwrap();
+            DimensionReading::Complete(asymmetry_to_witnessed_value(
                 result.asymmetry,
                 result.deadband,
             ))
@@ -386,12 +432,12 @@ fn assemble_analysis_frame(
             },
             DimensionCard {
                 meta: DIM_UNKNOWN,
-                reading: snapshot_approach(approach_unknown),
+                reading: snapshot_unknown(approach_unknown),
                 history: histories.unknown.iter().copied().collect(),
             },
             DimensionCard {
                 meta: DIM_WITNESSED,
-                reading: snapshot_approach(approach_witnessed),
+                reading: snapshot_witnessed(approach_witnessed),
                 history: histories.witnessed.iter().copied().collect(),
             },
         ],
@@ -590,12 +636,12 @@ impl SignalPipeline {
         );
         push_val(
             &mut self.histories.unknown,
-            &snapshot_approach(&self.approach_unknown),
+            &snapshot_unknown(&self.approach_unknown),
             HISTORY_CAP,
         );
         push_val(
             &mut self.histories.witnessed,
-            &snapshot_approach(&self.approach_witnessed),
+            &snapshot_witnessed(&self.approach_witnessed),
             HISTORY_CAP,
         );
     }
@@ -634,6 +680,23 @@ impl SignalPipeline {
                 self.approach_witnessed.stop();
                 Ok(())
             }
+        }
+    }
+
+    /// Stop all detectors that are currently running (Settling or Measuring).
+    /// Called on BLE disconnect to prevent detectors from being stuck forever.
+    pub fn stop_all_detectors(&mut self) {
+        if self.alpha_trend.is_running() {
+            self.alpha_trend.stop();
+        }
+        if self.entrainment.is_running() {
+            self.entrainment.stop();
+        }
+        if self.approach_unknown.is_running() {
+            self.approach_unknown.stop();
+        }
+        if self.approach_witnessed.is_running() {
+            self.approach_witnessed.stop();
         }
     }
 }
@@ -728,7 +791,7 @@ mod tests {
             artifact_ratio: 0.05,
         };
         let v = trend_to_value(&result);
-        assert_eq!(v.label, "Rising");
+        assert_eq!(v.label, "Deep");
         // 5.0 maps to (5+10)/20 = 0.75
         assert!((v.gauge_fraction - 0.75).abs() < 0.01);
     }
@@ -747,7 +810,7 @@ mod tests {
             artifact_ratio: 0.05,
         };
         let v = trend_to_value(&result);
-        assert_eq!(v.label, "Falling");
+        assert_eq!(v.label, "Surface");
         // -5.0 maps to (-5+10)/20 = 0.25
         assert!((v.gauge_fraction - 0.25).abs() < 0.01);
     }
@@ -766,7 +829,7 @@ mod tests {
             artifact_ratio: 0.0,
         };
         let v = trend_to_value(&result);
-        assert_eq!(v.label, "Flat");
+        assert_eq!(v.label, "Surface");
         // 0.0 maps to (0+10)/20 = 0.5
         assert!((v.gauge_fraction - 0.5).abs() < 0.01);
     }
@@ -785,27 +848,45 @@ mod tests {
     }
 
     #[test]
-    fn sp_asymmetry_value_lean() {
-        let v = asymmetry_to_value(0.2, 0.1);
-        assert_eq!(v.label, "Lean");
+    fn sp_unknown_value_lean_in() {
+        let v = asymmetry_to_unknown_value(0.2, 0.1);
+        assert_eq!(v.label, "Lean In");
     }
 
     #[test]
-    fn sp_asymmetry_value_hold() {
-        let v = asymmetry_to_value(-0.2, 0.1);
-        assert_eq!(v.label, "Hold");
+    fn sp_unknown_value_hold_back() {
+        let v = asymmetry_to_unknown_value(-0.2, 0.1);
+        assert_eq!(v.label, "Hold Back");
     }
 
     #[test]
-    fn sp_asymmetry_value_neutral() {
-        let v = asymmetry_to_value(0.05, 0.1);
+    fn sp_unknown_value_neutral() {
+        let v = asymmetry_to_unknown_value(0.05, 0.1);
+        assert_eq!(v.label, "Neutral");
+    }
+
+    #[test]
+    fn sp_witnessed_value_approach() {
+        let v = asymmetry_to_witnessed_value(0.2, 0.1);
+        assert_eq!(v.label, "Approach");
+    }
+
+    #[test]
+    fn sp_witnessed_value_withdraw() {
+        let v = asymmetry_to_witnessed_value(-0.2, 0.1);
+        assert_eq!(v.label, "Withdraw");
+    }
+
+    #[test]
+    fn sp_witnessed_value_neutral() {
+        let v = asymmetry_to_witnessed_value(0.05, 0.1);
         assert_eq!(v.label, "Neutral");
     }
 
     #[test]
     fn sp_asymmetry_gauge_centered() {
         // asymmetry = 0 should map to gauge fraction 0.5
-        let v = asymmetry_to_value(0.0, 0.1);
+        let v = asymmetry_to_unknown_value(0.0, 0.1);
         assert!((v.gauge_fraction - 0.5).abs() < 0.01);
     }
 

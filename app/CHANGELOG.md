@@ -1,3 +1,25 @@
+# v0.5.0
+
+## March 27, 2026
+
+## Per-device BLE reconnect
+
+Reconnect button on disconnected devices re-scans, auto-matches by `device_id`, and respawns the BLE task on the existing slot — preserving plot data, session file, and analysis state. Tab blinks red for 5 seconds on disconnect, status label shows Connected/Disconnected/Reconnecting.
+
+## Color-coded device tabs
+
+Each tab gets a painted circle dot with a light outline. Colors auto-assigned from `devices.json` (suffix → color mapping: 3623→green, 361d→blue, c346→white, 1bd5→black). Manual override via color picker button that cycles through 5 options.
+
+## Domain vocabulary for dimension labels
+
+Detector outputs now use glyph domain labels instead of generic signal labels. Absorption: Deep/Surface. Unknown: Lean In/Hold Back. Witnessed: Approach/Withdraw. Print selector and viz panels show the same vocabulary. Split `asymmetry_to_value()` and `snapshot_approach()` into per-dimension functions.
+
+## Auto-stop detectors on BLE disconnect
+
+Running dimension detectors (Settling/Measuring) reset to Idle when BLE drops. Prevents stale readings from persisting after headset disconnects.
+
+---
+
 # v0.4.0
 
 ## March 27, 2026
