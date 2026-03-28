@@ -1,3 +1,17 @@
+# v0.4.0
+
+## March 27, 2026
+
+## Alpha trend replaces baseline + absorption
+
+Replaced the 60-second baseline calibration and absorption detector with `AlphaTrendDetector` — online linear regression on frontal alpha (AF7 + AF8 mean). 5-second settling, runs continuously, classifies slope as Rising/Flat/Falling. Glyph mapping: Rising → deep, else → surface.
+
+## Remote glyph printing
+
+Viewer sends `POST /print` to the admin HTTP endpoint (port + 1) with dimension values as JSON. Server runs `print_receipt` locally where the USB thermal printer is attached.
+
+---
+
 # v0.3.0
 
 ## March 26, 2026

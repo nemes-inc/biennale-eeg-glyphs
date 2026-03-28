@@ -133,7 +133,7 @@ impl DeviceState {
             stream_start_us: None,
             max_points,
             analysis: AnalysisFrame::default(),
-            inference_pipeline: SignalPipeline::new(),
+            inference_pipeline: SignalPipeline::new_for_reconstructed(),
             recon_snapshots_fed: 0,
         }
     }
@@ -202,8 +202,8 @@ impl DeviceState {
             }
         }
 
-        // Try to produce an analysis frame from inference data
-        if let Some(frame) = self.inference_pipeline.try_analyze() {
+        // Drain all available analysis frames (one per HOP_SAMPLES worth of data)
+        while let Some(frame) = self.inference_pipeline.try_analyze() {
             self.analysis = frame;
             self.recon_snapshots_fed += 1;
         }

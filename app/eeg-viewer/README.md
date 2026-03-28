@@ -92,6 +92,11 @@ curl -X POST http://192.168.1.101:9101/restart
 
 # Clean shutdown
 curl -X POST http://192.168.1.101:9101/shutdown
+
+# Print glyph receipt on the server's USB printer
+curl -X POST http://192.168.1.101:9101/print \
+  -H "Content-Type: application/json" \
+  -d '{"absorption":"deep","attunement":"porous","unknown":"lean_in","witnessed":"approach"}'
 ```
 
 Override with `--admin-port 8080` if the default conflicts.
@@ -105,21 +110,83 @@ cd app/eeg-viewer
 
 Click Scan to find Muse headsets, click a device to connect, then click Connect Server. The bottom status bar shows frame counters for local processing, disk writes, and server sends. Reconstructed traces overlay in red at the original capture timestamp.
 
-## Inference-driven dimension analysis
+## Data packet flow
 
-All four dimension measurements (baseline, absorption, attunement, the unknown, witnessed) run on **reconstructed data from the inference server**, not raw Muse data. The flow is:
+All dimension measurements run on reconstructed data from the inference server, not raw Muse data.
 
-1. Raw EEG is streamed from Muse headset → written to session file → sent to inference server
-2. Server returns reconstructed EEGM frames → fed into `DeviceState`'s inference `SignalPipeline`
-3. The pipeline filters, windows, computes FFT/ACT, and feeds detectors
-4. UI reads the resulting `AnalysisFrame` from `DeviceState`
+### Packet path
 
-Detectors use **data-driven timing** (snapshot/window counts) instead of wall-clock durations. This means:
-- Phases transition when enough data has been accumulated, regardless of network latency
-- The settling and recording phases won't advance until inference data actually arrives
-- Progress bars reflect actual data volume, not elapsed time
+1. Muse sends BLE packets, 12 samples per electrode, 4 channels
+2. BLE loop (`muse_ble.rs`) accumulates 256 samples per channel into one EEGM frame, stamps `timestamp_us` from `SystemTime::now()`
+3. Frame written to session file (write-ahead log), then sent to inference server over TCP
+4. Server runs ZUNA diffusion on 5-second epochs, preserves `timestamp_us`, sends reconstructed EEGM frame back
+5. TCP recv task routes response by `headband_id` to `DeviceState::push_reconstructed_frame()`
+6. `push_reconstructed_frame` feeds samples into `SignalPipeline`, then drains all available analysis frames in a `while` loop
+7. Each frame stored as `DeviceState.analysis`, read by the UI on the next render tick
+
+```mermaid
+graph TD
+   A["Muse headset<br/>12 samples/packet, 4 channels"]:::ext --> B["BLE loop<br/>accumulates 256 samples into EEGM frame"]:::infra
+   B --> C["Session file<br/>write-ahead log"]:::storage
+   B --> D["TCP send task"]:::infra
+   D --> E["Inference server<br/>ZUNA diffusion, 5s epochs"]:::compute
+   E --> F["TCP recv task<br/>routes by headband_id"]:::infra
+   F --> G["push_reconstructed_frame<br/>feeds SignalPipeline"]:::orch
+   G --> H["try_analyze loop<br/>one AnalysisFrame per 64 samples"]:::orch
+   H --> I["UI render<br/>dimension gauges, electrode map"]:::ext
+
+   classDef ext fill:#e1f5fe
+   classDef infra fill:#e8eaf6
+   classDef storage fill:#f3e5f5
+   classDef compute fill:#fce4ec
+   classDef orch fill:#e8f5e9
+```
+
+### Analysis hop rate
+
+`SignalPipeline` produces one `AnalysisFrame` every 64 samples on the TP9 channel, roughly 4 frames/sec at 256 Hz. Each server response carries ~256 samples. The pipeline subtracts `HOP_SAMPLES` from the hop counter per iteration instead of resetting to zero, so a single `push_reconstructed_frame` call produces ~4 analysis frames.
+
+### Reconstructed-data mode
+
+Pipeline created via `SignalPipeline::new_for_reconstructed()` with `trust_input = true`. Skips contact quality tracking and the 150 uV epoch amplitude limit. The inference server already denoises the signal; raw-BLE artifact checks reject reconstructed epochs due to higher amplitude scaling.
+
+### Detector timing
+
+- Phases advance by snapshot/window count, not wall clock (except alpha trend settling which uses wall clock)
+- Settling and measuring phases stall until inference data arrives
+- Progress bars reflect actual data volume; alpha trend shows elapsed time instead of percentage
 
 The Neural Aura panel shows a status banner indicating inference connectivity and data flow.
+
+### Dimension analysis
+
+ACT (Adaptive Chirplet Transform) runs only for Attunement. The other three dimensions use FFT-based analysis.
+
+**Absorption (Alpha Trend)**
+
+Online linear regression on frontal alpha power (AF7 + AF8 mean). No separate baseline phase required.
+
+1. User clicks "Start Absorption", `AlphaTrendDetector::start()` begins a 5-second settling period
+2. Each analysis hop, frontal alpha is averaged from the FFT snapshot and pushed into the regression accumulator
+3. Only accumulates when both AF7 and AF8 have clean epochs and good contact
+4. Computes normalised slope: `trend_pct_per_min = (slope / mean_alpha) × 60 × 100`
+5. Classification: Rising if trend > +2 %/min, Falling if < −2 %/min, Flat otherwise
+6. R² measures goodness of fit. Measurement runs until the user stops it
+
+**Attunement (ACT-based)**
+
+1. User clicks "Start Attunement", `EntrainmentDetector::start()` creates an `ActEngine` with a low-frequency dictionary: fc 0.5-4.0 Hz, 1024-sample windows, order 7 chirplets
+2. Each analysis hop, 4-channel filtered EEG windows go through `engine.transform_batch()` via FFI into the C++ ACT library
+3. ACT decomposes each window into chirplets:
+   - Coarse search: GPU GEMM of signal against all dictionary atoms (MLX on macOS, CPU on Linux)
+   - Greedy matching pursuit: extract top-7 chirplets iteratively, subtract best match each round
+   - BFGS refinement (optional): fine-tune each chirplet's `(tc, fc, logDt, c)` parameters via ALGLIB
+4. Detector checks each chirplet's `fc` against `beat_freq +/- tolerance` (default 2.0 +/- 0.5 Hz). Beat-matching chirplets contribute to `beat_energy`, all contribute to `total_energy`
+5. Entrainment SNR = `beat_energy / (total_energy - beat_energy)`. Above 1.5 threshold = Porous, below = Boundaried
+
+**Unknown / Witnessed (Approach)**
+
+Frontal alpha asymmetry: `(AF8 - AF7) / (AF8 + AF7)`. Positive = Lean, negative = Hold
 
 ### Simulate mode
 

@@ -7,9 +7,8 @@
 use std::collections::VecDeque;
 
 use muse_rs::alpha::FftSnapshot;
-use muse_rs::absorption::{AbsorptionDetector, AbsorptionPhase};
+use muse_rs::alpha_trend::{AlphaTrendDetector, AlphaTrendPhase};
 use muse_rs::approach::{ApproachDetector, ApproachPhase};
-use muse_rs::baseline::{BaselineDetector, BaselinePhase};
 use muse_rs::compute::{ContactQuality, ContactQualityTracker};
 use muse_rs::entrainment::{EntrainmentDetector, EntrainmentPhase};
 use muse_rs::filters::{ChannelFilter, EpochStatus, EpochValidator};
@@ -80,7 +79,7 @@ pub struct DimensionValue {
 pub enum DimensionReading {
     Idle,
     Settling { progress: f32 },
-    Measuring { progress: f32, live: Option<DimensionValue> },
+    Measuring { progress: f32, live: Option<DimensionValue>, elapsed_s: Option<f32> },
     Complete(DimensionValue),
 }
 
@@ -177,19 +176,6 @@ impl Default for ElectrodeState {
     }
 }
 
-// ── Baseline State ───────────────────────────────────────────────────────────
-
-/// Baseline is a prerequisite, not a dimension.
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
-pub enum BaselineState {
-    #[default]
-    NotCollected,
-    Collecting { progress: f32 },
-    Collected,
-    Failed(String),
-}
-
 // ── Analysis Frame ───────────────────────────────────────────────────────────
 
 /// Complete analysis snapshot that crosses the mutex boundary.
@@ -198,8 +184,6 @@ pub enum BaselineState {
 pub struct AnalysisFrame {
     pub dimensions: [DimensionCard; 4],
     pub electrodes: ElectrodeState,
-    pub baseline_available: bool,
-    pub baseline_state: BaselineState,
 }
 
 impl Default for AnalysisFrame {
@@ -212,15 +196,7 @@ impl Default for AnalysisFrame {
                 DimensionCard { meta: DIM_WITNESSED, ..Default::default() },
             ],
             electrodes: ElectrodeState::default(),
-            baseline_available: false,
-            baseline_state: BaselineState::NotCollected,
         }
-    }
-}
-
-impl AnalysisFrame {
-    pub fn baseline_state(&self) -> &BaselineState {
-        &self.baseline_state
     }
 }
 
@@ -229,10 +205,8 @@ impl AnalysisFrame {
 /// Commands from UI thread to signal pipeline in BLE task.
 #[derive(Debug, Clone, Copy)]
 pub enum PipelineCommand {
-    StartBaseline,
-    StopBaseline,
-    StartAbsorption,
-    StopAbsorption,
+    StartAlphaTrend,
+    StopAlphaTrend,
     StartEntrainment,
     StopEntrainment,
     StartUnknown,
@@ -255,15 +229,19 @@ fn extract_window(buf: &VecDeque<f64>, len: usize) -> Vec<f64> {
     buf.iter().skip(start).copied().collect()
 }
 
-/// Map absorption percentage to a DimensionValue.
-/// Gauge range: -20% to +50%, so 0% maps to ~0.29 fraction.
-fn absorption_to_value(pct: f64, threshold: f64) -> DimensionValue {
-    let label = if pct >= threshold { "Deep" } else { "Surface" };
-    let fraction = ((pct - (-20.0)) / 70.0).clamp(0.0, 1.0) as f32;
+/// Map alpha trend result to a DimensionValue.
+/// Gauge range: -10 to +10 %/min, center at 0.5.
+fn trend_to_value(result: &muse_rs::alpha_trend::AlphaTrendResult) -> DimensionValue {
+    let label = match result.label {
+        muse_rs::alpha_trend::TrendLabel::Rising => "Rising",
+        muse_rs::alpha_trend::TrendLabel::Flat => "Flat",
+        muse_rs::alpha_trend::TrendLabel::Falling => "Falling",
+    };
+    let fraction = ((result.trend_pct_per_min + 10.0) / 20.0).clamp(0.0, 1.0) as f32;
     DimensionValue {
         label,
         gauge_fraction: fraction,
-        display_text: format!("{pct:+.1}%"),
+        display_text: format!("{:+.1}%/min", result.trend_pct_per_min),
     }
 }
 
@@ -303,24 +281,23 @@ fn asymmetry_to_value(asymmetry: f64, deadband: f64) -> DimensionValue {
 
 // ── Detector Snapshots (read-only, pure transforms) ──────────────────────────
 
-fn snapshot_absorption(det: &AbsorptionDetector) -> DimensionReading {
+fn snapshot_alpha_trend(det: &AlphaTrendDetector) -> DimensionReading {
     match &det.phase {
-        AbsorptionPhase::Idle | AbsorptionPhase::NeedBaseline => DimensionReading::Idle,
-        AbsorptionPhase::Settling => DimensionReading::Settling {
-            progress: det.progress() as f32,
+        AlphaTrendPhase::Idle => DimensionReading::Idle,
+        AlphaTrendPhase::Settling => {
+            let progress = (det.elapsed_s() / det.config.settling_duration_s).clamp(0.0, 1.0);
+            DimensionReading::Settling {
+                progress: progress as f32,
+            }
+        }
+        AlphaTrendPhase::Measuring => DimensionReading::Measuring {
+            progress: 0.0,
+            live: det.result.as_ref().map(trend_to_value),
+            elapsed_s: Some(det.measuring_elapsed_s() as f32),
         },
-        AbsorptionPhase::Measuring => DimensionReading::Measuring {
-            progress: det.progress() as f32,
-            live: det
-                .live_absorption_pct()
-                .map(|pct| absorption_to_value(pct, det.config.threshold_pct)),
-        },
-        AbsorptionPhase::Complete => {
+        AlphaTrendPhase::Complete => {
             let result = det.result.as_ref().unwrap();
-            DimensionReading::Complete(absorption_to_value(
-                result.absorption_pct,
-                result.threshold_pct,
-            ))
+            DimensionReading::Complete(trend_to_value(result))
         }
     }
 }
@@ -341,6 +318,7 @@ fn snapshot_entrainment(det: &EntrainmentDetector) -> DimensionReading {
                     None
                 }
             },
+            elapsed_s: None,
         },
         EntrainmentPhase::Complete => {
             let result = det.result.as_ref().unwrap();
@@ -363,6 +341,7 @@ fn snapshot_approach(det: &ApproachDetector) -> DimensionReading {
             live: det
                 .live_asymmetry()
                 .map(|a| asymmetry_to_value(a, det.config.deadband)),
+            elapsed_s: None,
         },
         ApproachPhase::Complete => {
             let result = det.result.as_ref().unwrap();
@@ -371,25 +350,6 @@ fn snapshot_approach(det: &ApproachDetector) -> DimensionReading {
                 result.deadband,
             ))
         }
-    }
-}
-
-fn snapshot_baseline(det: &BaselineDetector) -> BaselineState {
-    match &det.phase {
-        BaselinePhase::Idle => {
-            if det.result.is_some() {
-                BaselineState::Collected
-            } else {
-                BaselineState::NotCollected
-            }
-        }
-        BaselinePhase::Settling | BaselinePhase::Recording => {
-            BaselineState::Collecting {
-                progress: det.progress() as f32,
-            }
-        }
-        BaselinePhase::Complete => BaselineState::Collected,
-        BaselinePhase::Failed(msg) => BaselineState::Failed(msg.clone()),
     }
 }
 
@@ -404,11 +364,10 @@ fn extract_frontal_asymmetry(fft: &FftSnapshot) -> f32 {
 // ── Assemble Analysis Frame ──────────────────────────────────────────────────
 
 fn assemble_analysis_frame(
-    absorption: &AbsorptionDetector,
+    alpha_trend: &AlphaTrendDetector,
     entrainment: &EntrainmentDetector,
     approach_unknown: &ApproachDetector,
     approach_witnessed: &ApproachDetector,
-    baseline: &BaselineDetector,
     fft: &FftSnapshot,
     contact: &[ContactQuality; 4],
     histories: &DimensionHistories,
@@ -417,7 +376,7 @@ fn assemble_analysis_frame(
         dimensions: [
             DimensionCard {
                 meta: DIM_ABSORPTION,
-                reading: snapshot_absorption(absorption),
+                reading: snapshot_alpha_trend(alpha_trend),
                 history: histories.absorption.iter().copied().collect(),
             },
             DimensionCard {
@@ -441,8 +400,6 @@ fn assemble_analysis_frame(
             contact: *contact,
             frontal_asymmetry: extract_frontal_asymmetry(fft),
         },
-        baseline_available: baseline.result.is_some(),
-        baseline_state: snapshot_baseline(baseline),
     }
 }
 
@@ -466,14 +423,17 @@ pub struct SignalPipeline {
 
     samples_since_hop: usize,
 
-    baseline: BaselineDetector,
-    absorption: AbsorptionDetector,
+    alpha_trend: AlphaTrendDetector,
     entrainment: EntrainmentDetector,
     approach_unknown: ApproachDetector,
     approach_witnessed: ApproachDetector,
 
     histories: DimensionHistories,
     last_fft: Option<FftSnapshot>,
+
+    /// When true, skip contact quality and epoch validation
+    /// (reconstructed data is already processed by the inference server).
+    trust_input: bool,
 }
 
 impl SignalPipeline {
@@ -486,8 +446,7 @@ impl SignalPipeline {
             raw_bufs: std::array::from_fn(|_| VecDeque::with_capacity(BUF_CAP)),
             filtered_bufs: std::array::from_fn(|_| VecDeque::with_capacity(BUF_CAP)),
             samples_since_hop: 0,
-            baseline: BaselineDetector::default(),
-            absorption: AbsorptionDetector::default(),
+            alpha_trend: AlphaTrendDetector::default(),
             entrainment: EntrainmentDetector::default(),
             approach_unknown: ApproachDetector::default(),
             approach_witnessed: ApproachDetector::default(),
@@ -498,7 +457,20 @@ impl SignalPipeline {
                 witnessed: VecDeque::with_capacity(HISTORY_CAP),
             },
             last_fft: None,
+            trust_input: false,
         }
+    }
+
+    /// Create a pipeline for server-reconstructed EEG data.
+    ///
+    /// The inference server already denoises and validates the signal,
+    /// so raw-BLE artifact checks (contact quality, 150 µV amplitude
+    /// limit) are inappropriate and would reject valid reconstructed
+    /// epochs.  This constructor disables those checks.
+    pub fn new_for_reconstructed() -> Self {
+        let mut p = Self::new();
+        p.trust_input = true;
+        p
     }
 
     /// Ingest raw EEG samples for one channel.
@@ -527,27 +499,35 @@ impl SignalPipeline {
                 return None;
             }
         }
-        self.samples_since_hop = 0;
+        self.samples_since_hop -= HOP_SAMPLES;
 
-        // Contact quality
-        for ch in 0..4 {
-            let n = self.raw_bufs[ch].len().min(256);
-            if n > 0 {
-                let samples: Vec<f64> = self.raw_bufs[ch].iter().rev().take(n).copied().collect();
-                self.contact[ch] = self.contact_trackers[ch].update(&samples);
-            }
-        }
-
-        // Extract 512-sample windows and validate epochs
+        // Extract 512-sample windows
         let windows: [Vec<f64>; 4] =
             std::array::from_fn(|ch| extract_window(&self.filtered_bufs[ch], FFT_WINDOW));
-        let mut epoch_ok = [false; 4];
-        for ch in 0..4 {
-            let bad_contact = self.contact[ch] == ContactQuality::NoContact;
-            epoch_ok[ch] = matches!(
-                self.validators[ch].validate(&windows[ch], bad_contact),
-                EpochStatus::Clean
-            );
+
+        let epoch_ok;
+        if self.trust_input {
+            // Reconstructed data: trust the inference server's processing
+            self.contact = [ContactQuality::Good; 4];
+            epoch_ok = [true; 4];
+        } else {
+            // Raw BLE data: run contact quality and epoch validation
+            for ch in 0..4 {
+                let n = self.raw_bufs[ch].len().min(256);
+                if n > 0 {
+                    let samples: Vec<f64> = self.raw_bufs[ch].iter().rev().take(n).copied().collect();
+                    self.contact[ch] = self.contact_trackers[ch].update(&samples);
+                }
+            }
+            let mut ok = [false; 4];
+            for ch in 0..4 {
+                let bad_contact = self.contact[ch] == ContactQuality::NoContact;
+                ok[ch] = matches!(
+                    self.validators[ch].validate(&windows[ch], bad_contact),
+                    EpochStatus::Clean
+                );
+            }
+            epoch_ok = ok;
         }
 
         // FFT
@@ -556,8 +536,7 @@ impl SignalPipeline {
         self.last_fft = Some(fft.clone());
 
         // Feed running detectors
-        self.baseline.feed(&fft, &epoch_ok, &self.contact);
-        self.absorption.feed(&fft, &epoch_ok, &self.contact);
+        self.alpha_trend.feed(&fft, &epoch_ok, &self.contact);
         self.approach_unknown.feed(&fft, &epoch_ok, &self.contact);
         self.approach_witnessed.feed(&fft, &epoch_ok, &self.contact);
 
@@ -577,11 +556,10 @@ impl SignalPipeline {
 
         // Assemble frame
         let frame = assemble_analysis_frame(
-            &self.absorption,
+            &self.alpha_trend,
             &self.entrainment,
             &self.approach_unknown,
             &self.approach_witnessed,
-            &self.baseline,
             &fft,
             &self.contact,
             &self.histories,
@@ -602,7 +580,7 @@ impl SignalPipeline {
         }
         push_val(
             &mut self.histories.absorption,
-            &snapshot_absorption(&self.absorption),
+            &snapshot_alpha_trend(&self.alpha_trend),
             HISTORY_CAP,
         );
         push_val(
@@ -624,25 +602,12 @@ impl SignalPipeline {
 
     pub fn execute_command(&mut self, cmd: PipelineCommand) -> Result<(), &'static str> {
         match cmd {
-            PipelineCommand::StartBaseline => {
-                self.baseline.start();
+            PipelineCommand::StartAlphaTrend => {
+                self.alpha_trend.start();
                 Ok(())
             }
-            PipelineCommand::StopBaseline => {
-                self.baseline.stop();
-                Ok(())
-            }
-            PipelineCommand::StartAbsorption => {
-                let bl = self
-                    .baseline
-                    .result
-                    .as_ref()
-                    .ok_or("baseline required")?;
-                self.absorption.start(bl);
-                Ok(())
-            }
-            PipelineCommand::StopAbsorption => {
-                self.absorption.stop();
+            PipelineCommand::StopAlphaTrend => {
+                self.alpha_trend.stop();
                 Ok(())
             }
             PipelineCommand::StartEntrainment => self
@@ -750,29 +715,60 @@ mod tests {
     // ── Value mapping ────────────────────────────────────────────────────
 
     #[test]
-    fn sp_absorption_value_deep() {
-        let v = absorption_to_value(30.0, 25.0);
-        assert_eq!(v.label, "Deep");
-        let expected_frac = (30.0 - (-20.0)) / 70.0;
-        assert!((v.gauge_fraction - expected_frac as f32).abs() < 0.01);
+    fn sp_trend_value_rising() {
+        let result = muse_rs::alpha_trend::AlphaTrendResult {
+            slope: 0.01,
+            mean_alpha: 1.0,
+            trend_pct_per_min: 5.0,
+            r_squared: 0.9,
+            label: muse_rs::alpha_trend::TrendLabel::Rising,
+            deadband: 2.0,
+            n_samples: 100,
+            duration_s: 60.0,
+            artifact_ratio: 0.05,
+        };
+        let v = trend_to_value(&result);
+        assert_eq!(v.label, "Rising");
+        // 5.0 maps to (5+10)/20 = 0.75
+        assert!((v.gauge_fraction - 0.75).abs() < 0.01);
     }
 
     #[test]
-    fn sp_absorption_value_surface() {
-        let v = absorption_to_value(10.0, 25.0);
-        assert_eq!(v.label, "Surface");
+    fn sp_trend_value_falling() {
+        let result = muse_rs::alpha_trend::AlphaTrendResult {
+            slope: -0.01,
+            mean_alpha: 1.0,
+            trend_pct_per_min: -5.0,
+            r_squared: 0.9,
+            label: muse_rs::alpha_trend::TrendLabel::Falling,
+            deadband: 2.0,
+            n_samples: 100,
+            duration_s: 60.0,
+            artifact_ratio: 0.05,
+        };
+        let v = trend_to_value(&result);
+        assert_eq!(v.label, "Falling");
+        // -5.0 maps to (-5+10)/20 = 0.25
+        assert!((v.gauge_fraction - 0.25).abs() < 0.01);
     }
 
     #[test]
-    fn sp_absorption_value_clamped_low() {
-        let v = absorption_to_value(-30.0, 25.0);
-        assert_eq!(v.gauge_fraction, 0.0);
-    }
-
-    #[test]
-    fn sp_absorption_value_clamped_high() {
-        let v = absorption_to_value(60.0, 25.0);
-        assert_eq!(v.gauge_fraction, 1.0);
+    fn sp_trend_value_flat() {
+        let result = muse_rs::alpha_trend::AlphaTrendResult {
+            slope: 0.0,
+            mean_alpha: 1.0,
+            trend_pct_per_min: 0.0,
+            r_squared: 0.0,
+            label: muse_rs::alpha_trend::TrendLabel::Flat,
+            deadband: 2.0,
+            n_samples: 100,
+            duration_s: 60.0,
+            artifact_ratio: 0.0,
+        };
+        let v = trend_to_value(&result);
+        assert_eq!(v.label, "Flat");
+        // 0.0 maps to (0+10)/20 = 0.5
+        assert!((v.gauge_fraction - 0.5).abs() < 0.01);
     }
 
     #[test]
@@ -841,6 +837,7 @@ mod tests {
         let r = DimensionReading::Measuring {
             progress: 0.8,
             live: Some(v),
+            elapsed_s: None,
         };
         assert!(r.is_active());
         assert_eq!(r.progress(), 0.8);
@@ -897,35 +894,33 @@ mod tests {
     }
 
     #[test]
-    fn sp_pipeline_hop_resets_after_analysis() {
+    fn sp_pipeline_hop_drains_excess_samples() {
         let mut pipeline = SignalPipeline::new();
+        // Feed exactly FFT_WINDOW + HOP_SAMPLES (576 = 512 + 64)
         let signal: Vec<f64> = vec![0.0; FFT_WINDOW + HOP_SAMPLES];
         for ch in ChannelId::ALL {
             pipeline.ingest_samples(ch, &signal);
         }
-        // First analysis should succeed
+        // First analysis consumes 64 of the 576 hop-samples
         assert!(pipeline.try_analyze().is_some());
-        // Immediately after, not enough new samples
-        assert!(pipeline.try_analyze().is_none());
+        // 512 remain — should keep producing frames until < HOP_SAMPLES
+        let mut extra = 0;
+        while pipeline.try_analyze().is_some() {
+            extra += 1;
+        }
+        // 576 / 64 = 9 total frames; first consumed above, so 8 extra
+        assert_eq!(extra, (FFT_WINDOW + HOP_SAMPLES) / HOP_SAMPLES - 1);
     }
 
     #[test]
-    fn sp_pipeline_command_baseline() {
+    fn sp_pipeline_command_alpha_trend() {
         let mut pipeline = SignalPipeline::new();
-        assert!(pipeline.execute_command(PipelineCommand::StartBaseline).is_ok());
-        assert!(pipeline.execute_command(PipelineCommand::StopBaseline).is_ok());
+        assert!(pipeline.execute_command(PipelineCommand::StartAlphaTrend).is_ok());
+        assert!(pipeline.execute_command(PipelineCommand::StopAlphaTrend).is_ok());
     }
 
     #[test]
-    fn sp_pipeline_command_absorption_needs_baseline() {
-        let mut pipeline = SignalPipeline::new();
-        let result = pipeline.execute_command(PipelineCommand::StartAbsorption);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "baseline required");
-    }
-
-    #[test]
-    fn sp_pipeline_command_approach_no_baseline_needed() {
+    fn sp_pipeline_command_approach() {
         let mut pipeline = SignalPipeline::new();
         assert!(pipeline.execute_command(PipelineCommand::StartUnknown).is_ok());
         assert!(pipeline.execute_command(PipelineCommand::StartWitnessed).is_ok());
@@ -941,6 +936,5 @@ mod tests {
         assert_eq!(frame.dimensions[1].meta.name, "ATTUNEMENT");
         assert_eq!(frame.dimensions[2].meta.name, "THE UNKNOWN");
         assert_eq!(frame.dimensions[3].meta.name, "WITNESSED");
-        assert!(!frame.baseline_available);
     }
 }

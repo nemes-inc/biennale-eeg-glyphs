@@ -36,7 +36,7 @@ use device_state::{
 };
 use muse_ble::ScanResult;
 use signal_pipeline::{
-    AnalysisFrame, BaselineState, DimensionReading, PipelineCommand, VizMode,
+    AnalysisFrame, DimensionReading, PipelineCommand, VizMode,
 };
 use tcp_client::DeviceMap;
 
@@ -205,6 +205,7 @@ struct EegViewerApp {
     max_points: usize,
     input_kind: InputKind,
     tokio_rt: Arc<tokio::runtime::Runtime>,
+    #[allow(dead_code)]
     print_glyph_dir: PathBuf,
     #[allow(dead_code)]
     simulate: bool,
@@ -670,7 +671,6 @@ impl EegViewerApp {
             return;
         }
 
-        let print_glyph_dir = self.print_glyph_dir.clone();
         let (tx, rx) = mpsc::channel();
         self.job_rx = Some(rx);
         self.job_busy = true;
@@ -678,36 +678,86 @@ impl EegViewerApp {
         self.job_last_duration = None;
         self.pipeline_step = None;
         self.pipeline_label.clear();
-        self.job_log = format!("Printing glyph: {} ...\n", cli_args.join(" "));
+
+        // Build JSON body from CLI args: ["--absorption", "deep", ...] → {"absorption": "deep", ...}
+        let mut body = String::from("{");
+        let mut first = true;
+        let mut args_iter = cli_args.iter();
+        while let Some(key) = args_iter.next() {
+            if let Some(val) = args_iter.next() {
+                let dim = key.trim_start_matches('-');
+                if !first { body.push(','); }
+                body.push_str(&format!("\"{dim}\":\"{val}\""));
+                first = false;
+            }
+        }
+        body.push('}');
+
+        // Determine admin URL from server address
+        let admin_url = if let Some(ref addr) = self.server_addr {
+            if let Ok(sock) = addr.parse::<SocketAddr>() {
+                format!("http://{}:{}/print", sock.ip(), sock.port() + 1)
+            } else {
+                // Try host:port without SocketAddr parse
+                let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+                if parts.len() == 2 {
+                    if let Ok(port) = parts[0].parse::<u16>() {
+                        format!("http://{}:{}/print", parts[1], port + 1)
+                    } else {
+                        format!("http://{addr}:9101/print")
+                    }
+                } else {
+                    format!("http://{addr}:9101/print")
+                }
+            }
+        } else {
+            "http://127.0.0.1:9101/print".to_string()
+        };
+
+        self.job_log = format!("Printing glyph via {admin_url}\n{body}\n");
 
         thread::spawn(move || {
-            let result = Command::new("uv")
-                .arg("run")
-                .arg("--project")
-                .arg(&print_glyph_dir)
-                .arg("python")
-                .arg("-m")
-                .arg("print_glyph.print_receipt")
-                .args(&cli_args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
+            let result = std::net::TcpStream::connect_timeout(
+                &admin_url
+                    .trim_start_matches("http://")
+                    .trim_end_matches("/print")
+                    .parse::<SocketAddr>()
+                    .unwrap_or_else(|_| "127.0.0.1:9101".parse().unwrap()),
+                Duration::from_secs(5),
+            );
 
             match result {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    for line in stdout.lines() {
-                        let _ = tx.send(JobEvent::LogLine(format!("{line}\n")));
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let request = format!(
+                        "POST /print HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    if let Err(e) = stream.write_all(request.as_bytes()) {
+                        let _ = tx.send(JobEvent::LogLine(format!("Send failed: {e}\n")));
+                        let _ = tx.send(JobEvent::Done { ok: false });
+                        return;
                     }
-                    for line in stderr.lines() {
-                        let _ = tx.send(JobEvent::LogLine(format!("{line}\n")));
-                    }
-                    let _ = tx.send(JobEvent::Done { ok: o.status.success() });
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+                    let mut response = String::new();
+                    let _ = io::Read::read_to_string(&mut stream, &mut response);
+
+                    // Extract JSON body after blank line
+                    let json_body = response
+                        .split("\r\n\r\n")
+                        .nth(1)
+                        .unwrap_or(&response);
+                    let _ = tx.send(JobEvent::LogLine(format!("{json_body}\n")));
+
+                    let ok = response.contains("\"status\": \"printed\"")
+                        || response.contains("\"status\":\"printed\"");
+                    let _ = tx.send(JobEvent::Done { ok });
                 }
                 Err(e) => {
                     let _ = tx.send(JobEvent::LogLine(format!(
-                        "Failed to spawn uv: {e}\n(Is `uv` on PATH?)\n"
+                        "Cannot connect to server admin: {e}\n\
+                         Make sure the inference server is running.\n"
                     )));
                     let _ = tx.send(JobEvent::Done { ok: false });
                 }
@@ -1476,81 +1526,55 @@ fn render_dimension_controls(
     analysis: &AnalysisFrame,
     cmds: &mut Vec<PipelineCommand>,
 ) {
-    // Baseline button
-    match analysis.baseline_state() {
-        BaselineState::NotCollected | BaselineState::Failed(_) => {
-            if ui.button("Start Baseline").clicked() {
-                cmds.push(PipelineCommand::StartBaseline);
-            }
-        }
-        BaselineState::Collecting { progress } => {
-            if ui
-                .button(format!("Stop Baseline ({:.0}%)", progress * 100.0))
-                .clicked()
-            {
-                cmds.push(PipelineCommand::StopBaseline);
-            }
-        }
-        BaselineState::Collected => {
-            ui.add_enabled(false, egui::Button::new("Baseline done"));
-        }
-    }
-
-    ui.separator();
-
-    // Dimension start/stop buttons
-    let dims: [(
-        &str,
-        &DimensionReading,
-        PipelineCommand,
-        PipelineCommand,
-        bool,
-    ); 4] = [
+    let dims: [(&str, &DimensionReading, PipelineCommand, PipelineCommand); 4] = [
         (
             "Absorption",
             &analysis.dimensions[0].reading,
-            PipelineCommand::StartAbsorption,
-            PipelineCommand::StopAbsorption,
-            true, // needs baseline
+            PipelineCommand::StartAlphaTrend,
+            PipelineCommand::StopAlphaTrend,
         ),
         (
             "Attunement",
             &analysis.dimensions[1].reading,
             PipelineCommand::StartEntrainment,
             PipelineCommand::StopEntrainment,
-            false,
         ),
         (
             "Unknown",
             &analysis.dimensions[2].reading,
             PipelineCommand::StartUnknown,
             PipelineCommand::StopUnknown,
-            false,
         ),
         (
             "Witnessed",
             &analysis.dimensions[3].reading,
             PipelineCommand::StartWitnessed,
             PipelineCommand::StopWitnessed,
-            false,
         ),
     ];
 
-    for (name, reading, start_cmd, stop_cmd, needs_baseline) in &dims {
-        let enabled = !needs_baseline || analysis.baseline_available;
+    for (name, reading, start_cmd, stop_cmd) in &dims {
         match reading {
             DimensionReading::Idle => {
-                let btn = egui::Button::new(format!("Start {name}"));
-                if ui.add_enabled(enabled, btn).clicked() {
+                if ui.button(format!("Start {name}")).clicked() {
                     cmds.push(*start_cmd);
                 }
             }
-            DimensionReading::Settling { progress }
-            | DimensionReading::Measuring { progress, .. } => {
+            DimensionReading::Settling { progress } => {
                 if ui
                     .button(format!("Stop {name} ({:.0}%)", progress * 100.0))
                     .clicked()
                 {
+                    cmds.push(*stop_cmd);
+                }
+            }
+            DimensionReading::Measuring { progress, elapsed_s, .. } => {
+                let label = if let Some(secs) = elapsed_s {
+                    format!("Stop {name} ({secs:.0}s)")
+                } else {
+                    format!("Stop {name} ({:.0}%)", progress * 100.0)
+                };
+                if ui.button(label).clicked() {
                     cmds.push(*stop_cmd);
                 }
             }
@@ -1566,7 +1590,7 @@ fn render_dimension_controls(
 fn glyph_cli_args(analysis: &AnalysisFrame) -> Option<Vec<String>> {
     let absorption = match &analysis.dimensions[0].reading {
         DimensionReading::Complete(v) => match v.label {
-            "Deep" => "deep",
+            "Rising" => "deep",
             _ => "surface",
         },
         _ => return None,
