@@ -310,10 +310,15 @@ impl EntrainmentDetector {
         Ok(())
     }
 
-    /// Stop measurement and return to Idle.
+    /// Stop measurement. If measuring, finalize result and go to Complete.
+    /// Otherwise return to Idle.
     pub fn stop(&mut self) {
-        self.phase = EntrainmentPhase::Idle;
-        self.engine = None; // release engine
+        if matches!(self.phase, EntrainmentPhase::Measuring) {
+            self.finish();
+        } else {
+            self.phase = EntrainmentPhase::Idle;
+            self.engine = None;
+        }
     }
 
     /// Whether the detector is actively running (settling or measuring).

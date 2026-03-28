@@ -197,12 +197,6 @@ struct EegViewerApp {
     pipeline_step: Option<(u8, u8)>,
     pipeline_label: String,
 
-    // ── Glyph print selection ──
-    glyph_absorption: (bool, usize),  // (include, 0=deep/1=surface)
-    glyph_attunement: (bool, usize),  // (include, 0=porous/1=boundaried)
-    glyph_unknown: (bool, usize),     // (include, 0=lean_in/1=hold_back)
-    glyph_witnessed: (bool, usize),   // (include, 0=approach/1=withdraw)
-
     // ── Config ──
     max_points: usize,
     input_kind: InputKind,
@@ -214,6 +208,10 @@ struct EegViewerApp {
 
     // ── Device color config ──
     device_color_config: DeviceColorConfig,
+
+    // ── Dimension settings ──
+    all_devices_mode: bool,
+    show_dimension_settings: bool,
 
     // ── Legacy single-device state (stdin/TCP modes) ──
     legacy_state: Option<Arc<Mutex<SharedState>>>,
@@ -438,6 +436,7 @@ impl EegViewerApp {
             tab_color_idx: color_idx,
             disconnect_blink_until: None,
             was_streaming: false,
+            glyph_selections: [(true, 0); 4],
         });
 
         self.active_tab = self.connected_devices.len() - 1;
@@ -584,6 +583,7 @@ impl EegViewerApp {
             tab_color_idx: 0,
             disconnect_blink_until: None,
             was_streaming: false,
+            glyph_selections: [(true, 0); 4],
         });
 
         self.active_tab = 0;
@@ -1209,17 +1209,18 @@ impl EegViewerApp {
                         }
                     }
 
-                    ui.separator();
-
-                    // Color picker — cycle through 4 colors
-                    let color_idx = self.connected_devices[self.active_tab].tab_color_idx as usize;
-                    let current_color = TAB_COLORS[color_idx % TAB_COLORS.len()].1;
-                    let color_btn = egui::Button::new(
-                        RichText::new("●").color(current_color).size(16.0),
-                    );
-                    if ui.add(color_btn).on_hover_text("Change tab color").clicked() {
-                        self.connected_devices[self.active_tab].tab_color_idx =
-                            ((color_idx + 1) % TAB_COLORS.len()) as u8;
+                    // Color picker — only if device still exists after disconnect/remove
+                    if self.active_tab < self.connected_devices.len() {
+                        ui.separator();
+                        let color_idx = self.connected_devices[self.active_tab].tab_color_idx as usize;
+                        let current_color = TAB_COLORS[color_idx % TAB_COLORS.len()].1;
+                        let color_btn = egui::Button::new(
+                            RichText::new("●").color(current_color).size(16.0),
+                        );
+                        if ui.add(color_btn).on_hover_text("Change tab color").clicked() {
+                            self.connected_devices[self.active_tab].tab_color_idx =
+                                ((color_idx + 1) % TAB_COLORS.len()) as u8;
+                        }
                     }
                 }
             });
@@ -1248,95 +1249,143 @@ impl EegViewerApp {
             let mut print_args: Option<Vec<String>> = None;
             if self.active_tab < self.connected_devices.len()
             {
-                let analysis = {
-                    let device = &self.connected_devices[self.active_tab];
+                // Auto-stop detectors stuck after BLE disconnect (all devices)
+                for device in &self.connected_devices {
                     let (analysis, streaming) = {
                         let st = device.state.lock().unwrap();
                         (st.analysis.clone(), st.streaming)
                     };
-
-                    // Auto-stop detectors stuck after BLE disconnect
                     if !streaming && analysis.has_active_detectors() {
                         log::info!("BLE disconnected — stopping all running detectors");
                         let mut st = device.state.lock().unwrap();
                         st.stop_all_detectors();
                     }
+                }
 
-                    let mut cmds = Vec::new();
+                let analysis = {
+                    let st = self.connected_devices[self.active_tab].state.lock().unwrap();
+                    st.analysis.clone()
+                };
+
+                // Settings gear + dimension controls row
+                let mut cmds: Vec<PipelineCommand> = Vec::new();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("\u{2699}").size(16.0))
+                        .on_hover_text("Dimension settings")
+                        .clicked()
+                    {
+                        self.show_dimension_settings = !self.show_dimension_settings;
+                    }
+                    ui.separator();
+                    render_dimension_controls(ui, &analysis, &mut cmds);
+                });
+
+                // Settings panel
+                if self.show_dimension_settings {
                     ui.horizontal(|ui| {
-                        render_dimension_controls(ui, &analysis, &mut cmds);
+                        ui.add_space(28.0);
+                        ui.checkbox(&mut self.all_devices_mode, "All devices")
+                            .on_hover_text("Start/stop each dimension on all connected devices");
                     });
-                    // Execute collected commands on the inference pipeline
-                    if !cmds.is_empty() {
-                        let mut st = device.state.lock().unwrap();
-                        for cmd in cmds {
-                            if let Err(reason) = st.execute_pipeline_command(cmd) {
-                                log::warn!("Pipeline command rejected: {reason}");
+                }
+
+                // Dispatch commands to all devices or just active tab
+                if !cmds.is_empty() {
+                    let targets: Vec<usize> = if self.all_devices_mode {
+                        (0..self.connected_devices.len()).collect()
+                    } else {
+                        vec![self.active_tab]
+                    };
+                    let has_start = cmds.iter().any(|c| matches!(c,
+                        PipelineCommand::StartAlphaTrend
+                        | PipelineCommand::StartEntrainment
+                        | PipelineCommand::StartUnknown
+                        | PipelineCommand::StartWitnessed
+                        | PipelineCommand::StartAll
+                    ));
+                    for idx in targets {
+                        if let Some(device) = self.connected_devices.get(idx) {
+                            let mut st = device.state.lock().unwrap();
+                            if has_start {
+                                let _ = st.execute_pipeline_command(
+                                    PipelineCommand::SetContinuous(true),
+                                );
+                            }
+                            for &cmd in &cmds {
+                                if let Err(e) = st.execute_pipeline_command(cmd) {
+                                    log::warn!("Device {idx} command rejected: {e}");
+                                }
                             }
                         }
                     }
-                    analysis
+                }
+
+                let analysis = {
+                    let st = self.connected_devices[self.active_tab].state.lock().unwrap();
+                    st.analysis.clone()
                 };
 
-                // Auto-populate selectors from completed measurements
-                if let Some(args) = glyph_cli_args(&analysis) {
-                    self.glyph_absorption = (true, if args[1] == "deep" { 0 } else { 1 });
-                    self.glyph_attunement = (true, if args[3] == "porous" { 0 } else { 1 });
-                    self.glyph_unknown = (true, if args[5] == "lean_in" { 0 } else { 1 });
-                    self.glyph_witnessed = (true, if args[7] == "approach" { 0 } else { 1 });
+                // Auto-populate per-device selectors from completed dimensions
+                let dim_label_to_idx: [(usize, &[&str; 2]); 4] = [
+                    (0, &ABSORPTION_OPTS), (1, &ATTUNEMENT_OPTS),
+                    (2, &UNKNOWN_OPTS), (3, &WITNESSED_OPTS),
+                ];
+                for (dim_idx, opts) in &dim_label_to_idx {
+                    if let DimensionReading::Complete(v, _) = &analysis.dimensions[*dim_idx].reading {
+                        let sel = if v.label == opts[0] { 0 }
+                            else if v.label == opts[1] { 1 }
+                            else {
+                                // "Neutral" — pick closest based on gauge_fraction
+                                if v.gauge_fraction >= 0.5 { 0 } else { 1 }
+                            };
+                        self.connected_devices[self.active_tab].glyph_selections[*dim_idx] = (true, sel);
+                    }
                 }
 
                 // Glyph selectors + Print button
+                let glyph_sels = &mut self.connected_devices[self.active_tab].glyph_selections;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Print:").strong().size(11.0));
 
-                    let selectors: &mut [(&mut (bool, usize), &str, &[&str; 2])] = &mut [
-                        (&mut self.glyph_absorption, "absorption_sel", &ABSORPTION_OPTS),
-                        (&mut self.glyph_attunement, "attunement_sel", &ATTUNEMENT_OPTS),
-                        (&mut self.glyph_unknown, "unknown_sel", &UNKNOWN_OPTS),
-                        (&mut self.glyph_witnessed, "witnessed_sel", &WITNESSED_OPTS),
+                    let sel_meta: [(&str, &[&str; 2]); 4] = [
+                        ("absorption_sel", &ABSORPTION_OPTS),
+                        ("attunement_sel", &ATTUNEMENT_OPTS),
+                        ("unknown_sel", &UNKNOWN_OPTS),
+                        ("witnessed_sel", &WITNESSED_OPTS),
                     ];
-                    for (state, id, opts) in selectors.iter_mut() {
-                        ui.checkbox(&mut state.0, "");
-                        ui.add_enabled_ui(state.0, |ui| {
+                    for (i, (id, opts)) in sel_meta.iter().enumerate() {
+                        ui.checkbox(&mut glyph_sels[i].0, "");
+                        ui.add_enabled_ui(glyph_sels[i].0, |ui| {
                             egui::ComboBox::from_id_salt(*id)
                                 .width(90.0)
-                                .selected_text(opts[state.1])
+                                .selected_text(opts[glyph_sels[i].1])
                                 .show_ui(ui, |ui| {
-                                    for (i, label) in opts.iter().enumerate() {
-                                        ui.selectable_value(&mut state.1, i, *label);
+                                    for (j, label) in opts.iter().enumerate() {
+                                        ui.selectable_value(&mut glyph_sels[i].1, j, *label);
                                     }
                                 });
                         });
                         ui.add_space(4.0);
                     }
 
-                    let any_selected = self.glyph_absorption.0
-                        || self.glyph_attunement.0
-                        || self.glyph_unknown.0
-                        || self.glyph_witnessed.0;
+                    let any_selected = glyph_sels.iter().any(|(on, _)| *on);
                     let btn = egui::Button::new(
-                        RichText::new("🖨 Print")
+                        RichText::new("\u{1f5a8} Print")
                             .color(egui::Color32::from_rgb(80, 200, 120))
                             .strong(),
                     );
+                    let cli_opts: [&[&str; 2]; 4] = [
+                        &ABSORPTION_CLI, &ATTUNEMENT_CLI, &UNKNOWN_CLI, &WITNESSED_CLI,
+                    ];
+                    let cli_flags = ["--absorption", "--attunement", "--unknown", "--witnessed"];
                     if ui.add_enabled(!self.job_busy && any_selected, btn).clicked() {
                         let mut args = Vec::new();
-                        if self.glyph_absorption.0 {
-                            args.push("--absorption".into());
-                            args.push(ABSORPTION_CLI[self.glyph_absorption.1].into());
-                        }
-                        if self.glyph_attunement.0 {
-                            args.push("--attunement".into());
-                            args.push(ATTUNEMENT_CLI[self.glyph_attunement.1].into());
-                        }
-                        if self.glyph_unknown.0 {
-                            args.push("--unknown".into());
-                            args.push(UNKNOWN_CLI[self.glyph_unknown.1].into());
-                        }
-                        if self.glyph_witnessed.0 {
-                            args.push("--witnessed".into());
-                            args.push(WITNESSED_CLI[self.glyph_witnessed.1].into());
+                        for (i, flag) in cli_flags.iter().enumerate() {
+                            if glyph_sels[i].0 {
+                                args.push((*flag).into());
+                                args.push(cli_opts[i][glyph_sels[i].1].into());
+                            }
                         }
                         print_args = Some(args);
                     }
@@ -1771,6 +1820,16 @@ impl EegViewerApp {
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
+/// Format elapsed seconds as "Xm Ys" or "Ys".
+fn fmt_elapsed(secs: f32) -> String {
+    let total = secs as u32;
+    if total >= 60 {
+        format!("{}m {}s", total / 60, total % 60)
+    } else {
+        format!("{total}s")
+    }
+}
+
 fn render_dimension_controls(
     ui: &mut egui::Ui,
     analysis: &AnalysisFrame,
@@ -1820,7 +1879,7 @@ fn render_dimension_controls(
             }
             DimensionReading::Measuring { progress, elapsed_s, .. } => {
                 let label = if let Some(secs) = elapsed_s {
-                    format!("Stop {name} ({secs:.0}s)")
+                    format!("Stop {name} ({})", fmt_elapsed(*secs))
                 } else {
                     format!("Stop {name} ({:.0}%)", progress * 100.0)
                 };
@@ -1828,50 +1887,18 @@ fn render_dimension_controls(
                     cmds.push(*stop_cmd);
                 }
             }
-            DimensionReading::Complete(_) => {
-                ui.add_enabled(false, egui::Button::new(format!("{name} done")));
+            DimensionReading::Complete(_, elapsed) => {
+                let label = if let Some(s) = elapsed {
+                    format!("Start {name} (ran {})", fmt_elapsed(*s))
+                } else {
+                    format!("Start {name}")
+                };
+                if ui.button(label).clicked() {
+                    cmds.push(*start_cmd);
+                }
             }
         }
     }
-}
-
-/// Map completed dimension readings to Python CLI arguments for print_glyph.
-/// Returns None if any dimension is not yet Complete.
-fn glyph_cli_args(analysis: &AnalysisFrame) -> Option<Vec<String>> {
-    let absorption = match &analysis.dimensions[0].reading {
-        DimensionReading::Complete(v) => match v.label {
-            "Deep" => "deep",
-            _ => "surface",
-        },
-        _ => return None,
-    };
-    let attunement = match &analysis.dimensions[1].reading {
-        DimensionReading::Complete(v) => match v.label {
-            "Porous" => "porous",
-            _ => "boundaried",
-        },
-        _ => return None,
-    };
-    let unknown = match &analysis.dimensions[2].reading {
-        DimensionReading::Complete(v) => match v.label {
-            "Lean In" => "lean_in",
-            _ => "hold_back",
-        },
-        _ => return None,
-    };
-    let witnessed = match &analysis.dimensions[3].reading {
-        DimensionReading::Complete(v) => match v.label {
-            "Approach" => "approach",
-            _ => "withdraw",
-        },
-        _ => return None,
-    };
-    Some(vec![
-        "--absorption".into(), absorption.into(),
-        "--attunement".into(), attunement.into(),
-        "--unknown".into(), unknown.into(),
-        "--witnessed".into(), witnessed.into(),
-    ])
 }
 
 fn format_duration(d: Duration) -> String {
@@ -2230,10 +2257,6 @@ fn main() -> eframe::Result<()> {
                 job_last_duration: None,
                 pipeline_step: None,
                 pipeline_label: String::new(),
-                glyph_absorption: (true, 0),
-                glyph_attunement: (true, 0),
-                glyph_unknown: (true, 0),
-                glyph_witnessed: (true, 0),
                 max_points,
                 input_kind,
                 tokio_rt,
@@ -2242,6 +2265,8 @@ fn main() -> eframe::Result<()> {
                 legacy_state,
                 muse_status,
                 device_color_config: DeviceColorConfig::load(),
+                all_devices_mode: false,
+                show_dimension_settings: false,
                 resume_muse_pending: false,
                 reset_confirm_pending: false,
             };

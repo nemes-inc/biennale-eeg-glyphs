@@ -1,3 +1,17 @@
+# v0.6.0
+
+## March 27, 2026
+
+## Per-dimension all-devices mode
+
+Settings gear icon next to dimension controls. "All devices" checkbox sends each Start/Stop command to every connected Muse simultaneously — click "Start Absorption" once and it starts on all headsets.
+
+## Detectors run until stop
+
+Entrainment and Approach detectors no longer auto-complete at their default windows (40s and 20s). All detectors run continuously until you click Stop. Progress buttons show elapsed seconds.
+
+---
+
 # v0.5.0
 
 ## March 27, 2026

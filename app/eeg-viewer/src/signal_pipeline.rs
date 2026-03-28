@@ -80,7 +80,7 @@ pub enum DimensionReading {
     Idle,
     Settling { progress: f32 },
     Measuring { progress: f32, live: Option<DimensionValue>, elapsed_s: Option<f32> },
-    Complete(DimensionValue),
+    Complete(DimensionValue, Option<f32>),
 }
 
 impl DimensionReading {
@@ -97,7 +97,7 @@ impl DimensionReading {
 
     pub fn display_value(&self) -> Option<&DimensionValue> {
         match self {
-            Self::Complete(v) => Some(v),
+            Self::Complete(v, _) => Some(v),
             Self::Measuring { live: Some(v), .. } => Some(v),
             _ => None,
         }
@@ -211,6 +211,7 @@ impl AnalysisFrame {
 
 /// Commands from UI thread to signal pipeline in BLE task.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum PipelineCommand {
     StartAlphaTrend,
     StopAlphaTrend,
@@ -220,6 +221,9 @@ pub enum PipelineCommand {
     StopUnknown,
     StartWitnessed,
     StopWitnessed,
+    StartAll,
+    StopAll,
+    SetContinuous(bool),
 }
 
 // ── Semantic Functions (pure, testable) ──────────────────────────────────────
@@ -304,7 +308,7 @@ fn asymmetry_to_witnessed_value(asymmetry: f64, deadband: f64) -> DimensionValue
 
 // ── Detector Snapshots (read-only, pure transforms) ──────────────────────────
 
-fn snapshot_alpha_trend(det: &AlphaTrendDetector) -> DimensionReading {
+fn snapshot_alpha_trend(det: &AlphaTrendDetector, elapsed: Option<f32>) -> DimensionReading {
     match &det.phase {
         AlphaTrendPhase::Idle => DimensionReading::Idle,
         AlphaTrendPhase::Settling => {
@@ -316,16 +320,16 @@ fn snapshot_alpha_trend(det: &AlphaTrendDetector) -> DimensionReading {
         AlphaTrendPhase::Measuring => DimensionReading::Measuring {
             progress: 0.0,
             live: det.result.as_ref().map(trend_to_value),
-            elapsed_s: Some(det.measuring_elapsed_s() as f32),
+            elapsed_s: elapsed,
         },
         AlphaTrendPhase::Complete => {
             let result = det.result.as_ref().unwrap();
-            DimensionReading::Complete(trend_to_value(result))
+            DimensionReading::Complete(trend_to_value(result), elapsed)
         }
     }
 }
 
-fn snapshot_entrainment(det: &EntrainmentDetector) -> DimensionReading {
+fn snapshot_entrainment(det: &EntrainmentDetector, elapsed: Option<f32>) -> DimensionReading {
     match &det.phase {
         EntrainmentPhase::Idle => DimensionReading::Idle,
         EntrainmentPhase::Settling => DimensionReading::Settling {
@@ -341,19 +345,19 @@ fn snapshot_entrainment(det: &EntrainmentDetector) -> DimensionReading {
                     None
                 }
             },
-            elapsed_s: None,
+            elapsed_s: elapsed,
         },
         EntrainmentPhase::Complete => {
             let result = det.result.as_ref().unwrap();
             DimensionReading::Complete(entrainment_to_value(
                 result.mean_snr,
                 result.snr_threshold,
-            ))
+            ), elapsed)
         }
     }
 }
 
-fn snapshot_unknown(det: &ApproachDetector) -> DimensionReading {
+fn snapshot_unknown(det: &ApproachDetector, elapsed: Option<f32>) -> DimensionReading {
     match &det.phase {
         ApproachPhase::Idle => DimensionReading::Idle,
         ApproachPhase::Settling => DimensionReading::Settling {
@@ -364,19 +368,19 @@ fn snapshot_unknown(det: &ApproachDetector) -> DimensionReading {
             live: det
                 .live_asymmetry()
                 .map(|a| asymmetry_to_unknown_value(a, det.config.deadband)),
-            elapsed_s: None,
+            elapsed_s: elapsed,
         },
         ApproachPhase::Complete => {
             let result = det.result.as_ref().unwrap();
             DimensionReading::Complete(asymmetry_to_unknown_value(
                 result.asymmetry,
                 result.deadband,
-            ))
+            ), elapsed)
         }
     }
 }
 
-fn snapshot_witnessed(det: &ApproachDetector) -> DimensionReading {
+fn snapshot_witnessed(det: &ApproachDetector, elapsed: Option<f32>) -> DimensionReading {
     match &det.phase {
         ApproachPhase::Idle => DimensionReading::Idle,
         ApproachPhase::Settling => DimensionReading::Settling {
@@ -387,14 +391,14 @@ fn snapshot_witnessed(det: &ApproachDetector) -> DimensionReading {
             live: det
                 .live_asymmetry()
                 .map(|a| asymmetry_to_witnessed_value(a, det.config.deadband)),
-            elapsed_s: None,
+            elapsed_s: elapsed,
         },
         ApproachPhase::Complete => {
             let result = det.result.as_ref().unwrap();
             DimensionReading::Complete(asymmetry_to_witnessed_value(
                 result.asymmetry,
                 result.deadband,
-            ))
+            ), elapsed)
         }
     }
 }
@@ -417,27 +421,28 @@ fn assemble_analysis_frame(
     fft: &FftSnapshot,
     contact: &[ContactQuality; 4],
     histories: &DimensionHistories,
+    elapsed: [Option<f32>; 4],
 ) -> AnalysisFrame {
     AnalysisFrame {
         dimensions: [
             DimensionCard {
                 meta: DIM_ABSORPTION,
-                reading: snapshot_alpha_trend(alpha_trend),
+                reading: snapshot_alpha_trend(alpha_trend, elapsed[0]),
                 history: histories.absorption.iter().copied().collect(),
             },
             DimensionCard {
                 meta: DIM_ATTUNEMENT,
-                reading: snapshot_entrainment(entrainment),
+                reading: snapshot_entrainment(entrainment, elapsed[1]),
                 history: histories.entrainment.iter().copied().collect(),
             },
             DimensionCard {
                 meta: DIM_UNKNOWN,
-                reading: snapshot_unknown(approach_unknown),
+                reading: snapshot_unknown(approach_unknown, elapsed[2]),
                 history: histories.unknown.iter().copied().collect(),
             },
             DimensionCard {
                 meta: DIM_WITNESSED,
-                reading: snapshot_witnessed(approach_witnessed),
+                reading: snapshot_witnessed(approach_witnessed, elapsed[3]),
                 history: histories.witnessed.iter().copied().collect(),
             },
         ],
@@ -480,6 +485,12 @@ pub struct SignalPipeline {
     /// When true, skip contact quality and epoch validation
     /// (reconstructed data is already processed by the inference server).
     trust_input: bool,
+
+    continuous: bool,
+    /// Per-detector start times: [absorption, attunement, unknown, witnessed]
+    detector_start_times: [Option<std::time::Instant>; 4],
+    /// Frozen elapsed seconds after stop (overrides live elapsed from start_times)
+    detector_frozen_elapsed: [Option<f32>; 4],
 }
 
 impl SignalPipeline {
@@ -504,6 +515,9 @@ impl SignalPipeline {
             },
             last_fft: None,
             trust_input: false,
+            continuous: false,
+            detector_start_times: [None; 4],
+            detector_frozen_elapsed: [None; 4],
         }
     }
 
@@ -601,6 +615,7 @@ impl SignalPipeline {
         self.push_history_values();
 
         // Assemble frame
+        let elapsed = self.detector_elapsed_s();
         let frame = assemble_analysis_frame(
             &self.alpha_trend,
             &self.entrainment,
@@ -609,6 +624,7 @@ impl SignalPipeline {
             &fft,
             &self.contact,
             &self.histories,
+            elapsed,
         );
         Some(frame)
     }
@@ -626,66 +642,113 @@ impl SignalPipeline {
         }
         push_val(
             &mut self.histories.absorption,
-            &snapshot_alpha_trend(&self.alpha_trend),
+            &snapshot_alpha_trend(&self.alpha_trend, None),
             HISTORY_CAP,
         );
         push_val(
             &mut self.histories.entrainment,
-            &snapshot_entrainment(&self.entrainment),
+            &snapshot_entrainment(&self.entrainment, None),
             HISTORY_CAP,
         );
         push_val(
             &mut self.histories.unknown,
-            &snapshot_unknown(&self.approach_unknown),
+            &snapshot_unknown(&self.approach_unknown, None),
             HISTORY_CAP,
         );
         push_val(
             &mut self.histories.witnessed,
-            &snapshot_witnessed(&self.approach_witnessed),
+            &snapshot_witnessed(&self.approach_witnessed, None),
             HISTORY_CAP,
         );
     }
 
     pub fn execute_command(&mut self, cmd: PipelineCommand) -> Result<(), &'static str> {
+        let now = std::time::Instant::now();
         match cmd {
             PipelineCommand::StartAlphaTrend => {
                 self.alpha_trend.start();
+                self.detector_start_times[0] = Some(now);
+                self.detector_frozen_elapsed[0] = None;
                 Ok(())
             }
             PipelineCommand::StopAlphaTrend => {
+                self.freeze_elapsed(0);
                 self.alpha_trend.stop();
                 Ok(())
             }
-            PipelineCommand::StartEntrainment => self
-                .entrainment
-                .start()
-                .map_err(|_| "ACT engine creation failed"),
+            PipelineCommand::StartEntrainment => {
+                self.entrainment
+                    .start()
+                    .map_err(|_| "ACT engine creation failed")?;
+                self.detector_start_times[1] = Some(now);
+                self.detector_frozen_elapsed[1] = None;
+                Ok(())
+            }
             PipelineCommand::StopEntrainment => {
+                self.freeze_elapsed(1);
                 self.entrainment.stop();
                 Ok(())
             }
             PipelineCommand::StartUnknown => {
                 self.approach_unknown.start();
+                self.detector_start_times[2] = Some(now);
+                self.detector_frozen_elapsed[2] = None;
                 Ok(())
             }
             PipelineCommand::StopUnknown => {
+                self.freeze_elapsed(2);
                 self.approach_unknown.stop();
                 Ok(())
             }
             PipelineCommand::StartWitnessed => {
                 self.approach_witnessed.start();
+                self.detector_start_times[3] = Some(now);
+                self.detector_frozen_elapsed[3] = None;
                 Ok(())
             }
             PipelineCommand::StopWitnessed => {
+                self.freeze_elapsed(3);
                 self.approach_witnessed.stop();
+                Ok(())
+            }
+            PipelineCommand::StartAll => self.start_all_detectors(),
+            PipelineCommand::StopAll => {
+                self.stop_all_detectors();
+                Ok(())
+            }
+            PipelineCommand::SetContinuous(on) => {
+                self.set_continuous(on);
                 Ok(())
             }
         }
     }
 
+    /// Start all four dimension detectors. In continuous mode, sets
+    /// measuring windows/snapshots to usize::MAX so they never auto-complete.
+    pub fn start_all_detectors(&mut self) -> Result<(), &'static str> {
+        if self.continuous {
+            self.entrainment.config.measuring_windows = usize::MAX;
+            self.approach_unknown.config.measuring_snapshots = usize::MAX;
+            self.approach_witnessed.config.measuring_snapshots = usize::MAX;
+        }
+        let now = std::time::Instant::now();
+        self.alpha_trend.start();
+        self.entrainment
+            .start()
+            .map_err(|_| "ACT engine creation failed")?;
+        self.approach_unknown.start();
+        self.approach_witnessed.start();
+        self.detector_start_times = [Some(now); 4];
+        self.detector_frozen_elapsed = [None; 4];
+        Ok(())
+    }
+
     /// Stop all detectors that are currently running (Settling or Measuring).
-    /// Called on BLE disconnect to prevent detectors from being stuck forever.
+    /// Freezes elapsed times so they stop ticking.
     pub fn stop_all_detectors(&mut self) {
+        for i in 0..4 {
+            self.freeze_elapsed(i);
+        }
         if self.alpha_trend.is_running() {
             self.alpha_trend.stop();
         }
@@ -698,6 +761,49 @@ impl SignalPipeline {
         if self.approach_witnessed.is_running() {
             self.approach_witnessed.stop();
         }
+    }
+
+    pub fn set_continuous(&mut self, on: bool) {
+        self.continuous = on;
+        if on {
+            self.entrainment.config.measuring_windows = usize::MAX;
+            self.approach_unknown.config.measuring_snapshots = usize::MAX;
+            self.approach_witnessed.config.measuring_snapshots = usize::MAX;
+        } else {
+            self.entrainment.config.measuring_windows = 160;
+            self.approach_unknown.config.measuring_snapshots = 80;
+            self.approach_witnessed.config.measuring_snapshots = 80;
+        }
+    }
+
+    /// Freeze the elapsed time for detector `idx` so it stops ticking.
+    fn freeze_elapsed(&mut self, idx: usize) {
+        if let Some(t) = self.detector_start_times[idx] {
+            self.detector_frozen_elapsed[idx] = Some(t.elapsed().as_secs_f32());
+        }
+    }
+
+    /// Per-detector elapsed seconds: [absorption, attunement, unknown, witnessed].
+    /// Returns frozen elapsed after stop, live elapsed while running.
+    pub fn detector_elapsed_s(&self) -> [Option<f32>; 4] {
+        std::array::from_fn(|i| {
+            self.detector_frozen_elapsed[i].or_else(|| {
+                self.detector_start_times[i].map(|t| t.elapsed().as_secs_f32())
+            })
+        })
+    }
+
+    /// Snapshot the current dimension readings from all detectors.
+    /// Used to update the cached analysis after stop without waiting for
+    /// the next try_analyze() call.
+    pub fn snapshot_readings(&self) -> [DimensionReading; 4] {
+        let elapsed = self.detector_elapsed_s();
+        [
+            snapshot_alpha_trend(&self.alpha_trend, elapsed[0]),
+            snapshot_entrainment(&self.entrainment, elapsed[1]),
+            snapshot_unknown(&self.approach_unknown, elapsed[2]),
+            snapshot_witnessed(&self.approach_witnessed, elapsed[3]),
+        ]
     }
 }
 
@@ -932,7 +1038,7 @@ mod tests {
             gauge_fraction: 1.0,
             display_text: "done".into(),
         };
-        let r = DimensionReading::Complete(v);
+        let r = DimensionReading::Complete(v, None);
         assert!(!r.is_active());
         assert_eq!(r.display_value().unwrap().label, "Done");
     }

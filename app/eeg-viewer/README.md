@@ -155,6 +155,8 @@ Pipeline created via `SignalPipeline::new_for_reconstructed()` with `trust_input
 - Phases advance by snapshot/window count, not wall clock (except alpha trend settling which uses wall clock)
 - Settling and measuring phases stall until inference data arrives
 - Progress bars reflect actual data volume; alpha trend shows elapsed time instead of percentage
+- Detectors run until manual stop (no auto-completion). Progress buttons show elapsed seconds.
+- **All-devices mode**: gear icon → "All devices" checkbox. Each Start/Stop button dispatches to every connected Muse simultaneously.
 
 The Neural Aura panel shows a status banner indicating inference connectivity and data flow.
 

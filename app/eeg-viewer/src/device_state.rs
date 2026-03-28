@@ -212,14 +212,35 @@ impl DeviceState {
     }
 
     /// Execute a pipeline command on the inference pipeline.
+    /// After stop commands, refreshes the cached analysis so the UI
+    /// immediately reflects Complete state without waiting for new data.
     pub fn execute_pipeline_command(&mut self, cmd: PipelineCommand) -> Result<(), &'static str> {
-        self.inference_pipeline.execute_command(cmd)
+        let result = self.inference_pipeline.execute_command(cmd);
+        if matches!(cmd,
+            PipelineCommand::StopAlphaTrend
+            | PipelineCommand::StopEntrainment
+            | PipelineCommand::StopUnknown
+            | PipelineCommand::StopWitnessed
+            | PipelineCommand::StopAll
+        ) {
+            let readings = self.inference_pipeline.snapshot_readings();
+            for (dim, reading) in self.analysis.dimensions.iter_mut().zip(readings) {
+                dim.reading = reading;
+            }
+        }
+        result
     }
 
     /// Stop all running detectors. Called on BLE disconnect to prevent
     /// detectors from being stuck in Settling/Measuring forever.
+    /// Detectors in Measuring go to Complete (preserving results).
+    /// Detectors in Settling go to Idle.
     pub fn stop_all_detectors(&mut self) {
         self.inference_pipeline.stop_all_detectors();
+        let readings = self.inference_pipeline.snapshot_readings();
+        for (dim, reading) in self.analysis.dimensions.iter_mut().zip(readings) {
+            dim.reading = reading;
+        }
     }
 
     /// Convert an absolute timestamp to seconds relative to stream start.
@@ -411,6 +432,9 @@ pub struct ConnectedDevice {
     pub disconnect_blink_until: Option<std::time::Instant>,
     /// Previous streaming state for detecting disconnect transitions.
     pub was_streaming: bool,
+    /// Per-device glyph print selections: (include, option_index).
+    /// [absorption, attunement, unknown, witnessed]
+    pub glyph_selections: [(bool, usize); 4],
 }
 
 // ── Semantic functions (pure, testable) ──────────────────────────────────────
@@ -806,6 +830,7 @@ mod tests {
             tab_color_idx: 0,
             disconnect_blink_until: None,
             was_streaming: false,
+            glyph_selections: [(true, 0); 4],
         }
     }
 

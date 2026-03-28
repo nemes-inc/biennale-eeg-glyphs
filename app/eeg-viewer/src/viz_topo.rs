@@ -213,10 +213,10 @@ fn paint_compact_dimension(ui: &mut egui::Ui, card: &DimensionCard) {
                         DimensionReading::Idle => "\u{2014}",
                         DimensionReading::Settling { .. } => "Settling",
                         DimensionReading::Measuring { .. } => "Measuring",
-                        DimensionReading::Complete(_) => "\u{2713}",
+                        DimensionReading::Complete(..) => "\u{2713}",
                     };
                     let status_color = match &card.reading {
-                        DimensionReading::Complete(_) => color,
+                        DimensionReading::Complete(..) => color,
                         DimensionReading::Idle => Color32::from_gray(80),
                         _ => Color32::from_gray(140),
                     };
