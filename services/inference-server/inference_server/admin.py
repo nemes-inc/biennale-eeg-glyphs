@@ -7,6 +7,7 @@ no framework dependencies. Supports:
     GET  /status   → JSON stats (frames, epochs, workers, uptime)
     POST /restart  → git pull + os.execv to restart with updated code
     POST /shutdown → clean server shutdown
+    POST /print    → run print_receipt with dimension values
 
 All endpoints return JSON. No auth — this is for local-network admin only.
 """
@@ -70,11 +71,23 @@ async def _handle_admin(
 
     method, path = parts[0].upper(), parts[1]
 
-    # Drain remaining headers (we don't need the body for any endpoint)
+    # Read headers and extract Content-Length
+    content_length = 0
     while True:
         line = await reader.readline()
         if line in (b"\r\n", b"\n", b""):
             break
+        header = line.decode(errors="replace").strip().lower()
+        if header.startswith("content-length:"):
+            try:
+                content_length = int(header.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+
+    # Read body if present
+    body = b""
+    if content_length > 0:
+        body = await asyncio.wait_for(reader.readexactly(content_length), timeout=5.0)
 
     if path == "/status":
         if method != "GET":
@@ -86,6 +99,11 @@ async def _handle_admin(
             resp = _json_response(405, {"error": "use POST"})
         else:
             resp = await _handle_restart(server)
+    elif path == "/print":
+        if method != "POST":
+            resp = _json_response(405, {"error": "use POST"})
+        else:
+            resp = await _handle_print(body)
     elif path == "/shutdown":
         if method != "POST":
             resp = _json_response(405, {"error": "use POST"})
@@ -97,7 +115,7 @@ async def _handle_admin(
             server.shutdown()
             return
     else:
-        resp = _json_response(404, {"error": "not found", "endpoints": ["/status", "/restart", "/shutdown"]})
+        resp = _json_response(404, {"error": "not found", "endpoints": ["/status", "/restart", "/shutdown", "/print"]})
 
     writer.write(resp)
     await writer.drain()
@@ -118,6 +136,68 @@ def _build_status(server: InferenceServer) -> dict:
         "epochs_dropped": server.epochs_dropped,
         "client_connected": server._writer is not None,
     }
+
+
+_VALID_DIMS = {
+    "absorption": ("deep", "surface"),
+    "attunement": ("porous", "boundaried"),
+    "unknown": ("lean_in", "hold_back"),
+    "witnessed": ("approach", "withdraw"),
+}
+
+
+async def _handle_print(body: bytes) -> bytes:
+    """Run print_receipt with dimension values from JSON body."""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return _json_response(400, {"error": "invalid JSON body"})
+
+    if not isinstance(data, dict):
+        return _json_response(400, {"error": "expected JSON object"})
+
+    # Validate and build CLI args
+    cli_args = []
+    for dim, valid_values in _VALID_DIMS.items():
+        val = data.get(dim)
+        if val is not None:
+            if val not in valid_values:
+                return _json_response(400, {
+                    "error": f"invalid value '{val}' for {dim}",
+                    "valid": list(valid_values),
+                })
+            cli_args.extend([f"--{dim}", val])
+
+    if not cli_args:
+        return _json_response(400, {"error": "at least one dimension required"})
+
+    # Find print-glyph project relative to this file
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    print_glyph_dir = os.path.join(repo_root, "print-glyph")
+
+    cmd = ["uv", "run", "--project", print_glyph_dir,
+           "python", "-m", "print_glyph.print_receipt"] + cli_args
+    log.info("Print: %s", " ".join(cmd))
+
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run, cmd,
+            capture_output=True, text=True, timeout=60,
+        )
+        output = result.stdout.strip()
+        if result.stderr.strip():
+            output += "\n" + result.stderr.strip()
+
+        if result.returncode == 0:
+            log.info("Print done: %s", output)
+            return _json_response(200, {"status": "printed", "output": output})
+        else:
+            log.warning("Print failed: %s", output)
+            return _json_response(200, {"status": "print_failed", "output": output})
+    except subprocess.TimeoutExpired:
+        return _json_response(200, {"status": "print_timeout"})
+    except FileNotFoundError:
+        return _json_response(200, {"status": "uv_not_found", "output": "uv not on PATH"})
 
 
 async def _handle_restart(server: InferenceServer) -> bytes:
