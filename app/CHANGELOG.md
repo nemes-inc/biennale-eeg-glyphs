@@ -1,3 +1,17 @@
+# v0.8.0
+
+## March 28, 2026
+
+## ACT processing off the data path
+
+ACT `transform_batch()` (80-200ms C++ FFI) moved from the `DeviceState` mutex to a dedicated `act-worker` OS thread. Communicates via bounded `mpsc` channels — `try_send`/`try_recv` on the data path, both <1us. Graphs no longer stutter during Attunement measurement.
+
+## All-devices mode defaults to on
+
+"All devices" checkbox starts checked. Start/Stop commands dispatch to all connected Muses by default.
+
+---
+
 # v0.7.0
 
 ## March 27, 2026

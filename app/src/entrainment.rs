@@ -199,6 +199,20 @@ impl ChannelAccum {
         }
     }
 
+    pub fn accumulate(&mut self, chirplets: &[Chirplet], beat_lo: f64, beat_hi: f64, is_clean: bool) {
+        self.total_windows += 1;
+        if !is_clean { return; }
+        self.clean_windows += 1;
+        for chirp in chirplets {
+            let energy = (chirp.coeff as f64).powi(2);
+            self.total_energy += energy;
+            if is_beat_chirplet(chirp, beat_lo, beat_hi) {
+                self.beat_energy += energy;
+                self.beat_chirplet_count += 1;
+            }
+        }
+    }
+
     /// Artifact ratio: fraction of windows rejected.
     pub fn artifact_ratio(&self) -> f64 {
         if self.total_windows == 0 {
@@ -310,6 +324,51 @@ impl EntrainmentDetector {
         Ok(())
     }
 
+    pub fn start_without_engine(&mut self) {
+        self.opts = self.dict_config.to_transform_opts();
+        self.engine = None;
+        self.phase = EntrainmentPhase::Settling;
+        self.settling_count = 0;
+        self.measuring_count = 0;
+        for ch in &mut self.channels { ch.reset(); }
+        self.result = None;
+    }
+
+    pub fn advance_settling(&mut self) -> bool {
+        if !matches!(self.phase, EntrainmentPhase::Settling) { return false; }
+        self.settling_count += 1;
+        if self.settling_count >= self.config.settling_windows {
+            self.phase = EntrainmentPhase::Measuring;
+            return true;
+        }
+        false
+    }
+
+    pub fn needs_transform(&self) -> bool {
+        matches!(self.phase, EntrainmentPhase::Measuring)
+    }
+
+    pub fn apply_transform_result(
+        &mut self,
+        results: &[crate::act::ChannelResult],
+        epoch_ok: &[bool; NUM_CH],
+        contact: &[ContactQuality; NUM_CH],
+    ) {
+        if !matches!(self.phase, EntrainmentPhase::Measuring) { return; }
+        self.measuring_count += 1;
+
+        let beat_lo = self.config.beat_freq_hz - self.config.fc_tolerance_hz;
+        let beat_hi = self.config.beat_freq_hz + self.config.fc_tolerance_hz;
+        for (ch, cr) in results.iter().enumerate().take(NUM_CH) {
+            let is_clean = epoch_ok[ch] && contact[ch] != ContactQuality::NoContact;
+            self.channels[ch].accumulate(&cr.chirplets, beat_lo, beat_hi, is_clean);
+        }
+
+        if self.measuring_count >= self.config.measuring_windows {
+            self.finish();
+        }
+    }
+
     /// Stop measurement. If measuring, finalize result and go to Complete.
     /// Otherwise return to Idle.
     pub fn stop(&mut self) {
@@ -373,33 +432,11 @@ impl EntrainmentDetector {
             }
         };
 
-        // Accumulate per-channel energy
         let beat_lo = self.config.beat_freq_hz - self.config.fc_tolerance_hz;
         let beat_hi = self.config.beat_freq_hz + self.config.fc_tolerance_hz;
         for (ch, cr) in results.iter().enumerate().take(NUM_CH) {
-            self.channels[ch].total_windows += 1;
-
             let is_clean = epoch_ok[ch] && contact[ch] != ContactQuality::NoContact;
-            if !is_clean {
-                continue;
-            }
-            self.channels[ch].clean_windows += 1;
-
-            for (i, chirp) in cr.chirplets.iter().enumerate() {
-                let energy = (chirp.coeff as f64).powi(2);
-                self.channels[ch].total_energy += energy;
-
-                log::debug!(
-                    "ENT ch{ch} chirp[{i}]: fc={:.3} log_dt={:.2} cr={:.3} coeff={:.1} E={:.1}",
-                    chirp.fc, chirp.log_dt, chirp.chirp_rate, chirp.coeff, energy,
-                );
-
-                if is_beat_chirplet(chirp, beat_lo, beat_hi) {
-                    self.channels[ch].beat_energy += energy;
-                    self.channels[ch].beat_chirplet_count += 1;
-                    log::debug!("  → BEAT MATCH");
-                }
-            }
+            self.channels[ch].accumulate(&cr.chirplets, beat_lo, beat_hi, is_clean);
         }
 
         // Check completion
@@ -595,5 +632,113 @@ mod tests {
         assert!(act_cfg.fc_range.1 >= 2.0);
         // Fine resolution
         assert!(act_cfg.fc_range.2 <= 0.5);
+    }
+
+    #[test]
+    fn accumulate_beat_chirplets() {
+        let mut acc = ChannelAccum::default();
+        let chirplets = vec![
+            Chirplet { tc: 0.0, fc: 2.0, log_dt: -1.0, chirp_rate: 0.0, coeff: 3.0 },
+            Chirplet { tc: 0.0, fc: 8.0, log_dt: -1.0, chirp_rate: 0.0, coeff: 4.0 },
+        ];
+        acc.accumulate(&chirplets, 1.5, 2.5, true);
+        assert_eq!(acc.total_windows, 1);
+        assert_eq!(acc.clean_windows, 1);
+        assert!((acc.beat_energy - 9.0).abs() < 1e-10);
+        assert!((acc.total_energy - 25.0).abs() < 1e-10);
+        assert_eq!(acc.beat_chirplet_count, 1);
+    }
+
+    #[test]
+    fn accumulate_dirty_window() {
+        let mut acc = ChannelAccum::default();
+        let chirplets = vec![
+            Chirplet { tc: 0.0, fc: 2.0, log_dt: -1.0, chirp_rate: 0.0, coeff: 3.0 },
+        ];
+        acc.accumulate(&chirplets, 1.5, 2.5, false);
+        assert_eq!(acc.total_windows, 1);
+        assert_eq!(acc.clean_windows, 0);
+        assert!((acc.beat_energy - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn start_without_engine_resets_state() {
+        let mut det = EntrainmentDetector::default();
+        det.start_without_engine();
+        assert_eq!(det.phase, EntrainmentPhase::Settling);
+        assert!(det.engine.is_none());
+        assert_eq!(det.settling_count, 0);
+        assert_eq!(det.measuring_count, 0);
+        assert!(det.is_running());
+    }
+
+    #[test]
+    fn advance_settling_transitions_at_threshold() {
+        let mut det = EntrainmentDetector::default();
+        det.start_without_engine();
+        for _ in 0..det.config.settling_windows - 1 {
+            assert!(!det.advance_settling());
+            assert_eq!(det.phase, EntrainmentPhase::Settling);
+        }
+        assert!(det.advance_settling());
+        assert_eq!(det.phase, EntrainmentPhase::Measuring);
+    }
+
+    #[test]
+    fn advance_settling_noop_outside_settling() {
+        let mut det = EntrainmentDetector::default();
+        assert!(!det.advance_settling()); // Idle
+    }
+
+    #[test]
+    fn needs_transform_only_in_measuring() {
+        let mut det = EntrainmentDetector::default();
+        assert!(!det.needs_transform());
+        det.start_without_engine();
+        assert!(!det.needs_transform()); // Settling
+        det.phase = EntrainmentPhase::Measuring;
+        assert!(det.needs_transform());
+    }
+
+    #[test]
+    fn apply_transform_result_accumulates() {
+        use crate::act::ChannelResult;
+
+        let mut det = EntrainmentDetector::default();
+        det.start_without_engine();
+        det.phase = EntrainmentPhase::Measuring;
+
+        let results: Vec<ChannelResult> = (0..NUM_CH).map(|_| ChannelResult {
+            chirplets: vec![
+                Chirplet { tc: 0.0, fc: 2.0, log_dt: -1.0, chirp_rate: 0.0, coeff: 3.0 },
+            ],
+            error: 0.0,
+        }).collect();
+        let epoch_ok = [true; NUM_CH];
+        let contact = [ContactQuality::Good; NUM_CH];
+
+        det.apply_transform_result(&results, &epoch_ok, &contact);
+        assert_eq!(det.measuring_count, 1);
+        assert!((det.channels[0].beat_energy - 9.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn apply_transform_result_discards_outside_measuring() {
+        use crate::act::ChannelResult;
+
+        let mut det = EntrainmentDetector::default();
+        // Idle phase — should discard
+        let results: Vec<ChannelResult> = (0..NUM_CH).map(|_| ChannelResult {
+            chirplets: vec![
+                Chirplet { tc: 0.0, fc: 2.0, log_dt: -1.0, chirp_rate: 0.0, coeff: 3.0 },
+            ],
+            error: 0.0,
+        }).collect();
+        let epoch_ok = [true; NUM_CH];
+        let contact = [ContactQuality::Good; NUM_CH];
+
+        det.apply_transform_result(&results, &epoch_ok, &contact);
+        assert_eq!(det.measuring_count, 0);
+        assert!((det.channels[0].beat_energy - 0.0).abs() < 1e-10);
     }
 }

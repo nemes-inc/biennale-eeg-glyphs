@@ -5,12 +5,15 @@
 //! snapshots that cross the mutex boundary to the UI thread.
 
 use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::time::Duration;
 
+use muse_rs::act::{ActEngine, ChannelResult, TransformOpts};
 use muse_rs::alpha::FftSnapshot;
 use muse_rs::alpha_trend::{AlphaTrendDetector, AlphaTrendPhase};
 use muse_rs::approach::{ApproachDetector, ApproachPhase};
 use muse_rs::compute::{ContactQuality, ContactQualityTracker};
-use muse_rs::entrainment::{EntrainmentDetector, EntrainmentPhase};
+use muse_rs::entrainment::{EntrainmentDetector, EntrainmentDictConfig, EntrainmentPhase};
 use muse_rs::filters::{ChannelFilter, EpochStatus, EpochValidator};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -454,6 +457,120 @@ fn assemble_analysis_frame(
     }
 }
 
+// ── ACT Worker Types ─────────────────────────────────────────────────────────
+
+const NUM_CH: usize = 4;
+
+struct ActWorkItem {
+    windows: [Vec<f64>; NUM_CH],
+    epoch_ok: [bool; NUM_CH],
+    contact: [ContactQuality; NUM_CH],
+}
+
+struct ActWorkResult {
+    channel_results: Vec<ChannelResult>,
+    epoch_ok: [bool; NUM_CH],
+    contact: [ContactQuality; NUM_CH],
+}
+
+enum ActWorkerCommand {
+    Start(EntrainmentDictConfig),
+    Stop,
+    Shutdown,
+}
+
+struct ActWorkerHandle {
+    cmd_tx: mpsc::Sender<ActWorkerCommand>,
+    work_tx: mpsc::SyncSender<ActWorkItem>,
+    result_rx: mpsc::Receiver<ActWorkResult>,
+}
+
+// ── ACT Worker Functions ─────────────────────────────────────────────────────
+
+fn spawn_act_worker() -> ActWorkerHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ActWorkerCommand>();
+    let (work_tx, work_rx) = mpsc::sync_channel::<ActWorkItem>(2);
+    let (result_tx, result_rx) = mpsc::channel::<ActWorkResult>();
+
+    std::thread::Builder::new()
+        .name("act-worker".into())
+        .spawn(move || act_worker_loop(cmd_rx, work_rx, result_tx))
+        .expect("failed to spawn act-worker thread");
+
+    ActWorkerHandle { cmd_tx, work_tx, result_rx }
+}
+
+fn act_worker_loop(
+    cmd_rx: mpsc::Receiver<ActWorkerCommand>,
+    work_rx: mpsc::Receiver<ActWorkItem>,
+    result_tx: mpsc::Sender<ActWorkResult>,
+) {
+    let mut engine: Option<ActEngine> = None;
+    let mut opts: Option<TransformOpts> = None;
+
+    loop {
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(ActWorkerCommand::Start(dict_config)) => {
+                    let act_cfg = dict_config.to_act_config();
+                    match ActEngine::new(&act_cfg) {
+                        Ok(e) => {
+                            log::info!(
+                                "ACT worker: engine created, dict_size={}",
+                                e.dict_size()
+                            );
+                            opts = Some(dict_config.to_transform_opts());
+                            engine = Some(e);
+                        }
+                        Err(e) => log::error!("ACT worker: engine creation failed: {e}"),
+                    }
+                }
+                Ok(ActWorkerCommand::Stop) => {
+                    engine = None;
+                    opts = None;
+                    while work_rx.try_recv().is_ok() {}
+                    log::info!("ACT worker: engine stopped");
+                }
+                Ok(ActWorkerCommand::Shutdown) => {
+                    log::info!("ACT worker: shutting down");
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+
+        match work_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(item) => {
+                if let (Some(eng), Some(o)) = (&engine, &opts) {
+                    let refs: Vec<&[f64]> =
+                        item.windows.iter().map(|w| w.as_slice()).collect();
+                    match eng.transform_batch(&refs, o) {
+                        Ok(channel_results) => {
+                            let _ = result_tx.send(ActWorkResult {
+                                channel_results,
+                                epoch_ok: item.epoch_ok,
+                                contact: item.contact,
+                            });
+                        }
+                        Err(e) => log::warn!("ACT worker: transform failed: {e}"),
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn extract_entrainment_windows(
+    filtered_bufs: &[VecDeque<f64>; 4],
+) -> Option<[Vec<f64>; 4]> {
+    let has_enough = (0..4).all(|ch| filtered_bufs[ch].len() >= ENT_WINDOW);
+    if !has_enough { return None; }
+    Some(std::array::from_fn(|ch| extract_window(&filtered_bufs[ch], ENT_WINDOW)))
+}
+
 // ── Signal Pipeline ──────────────────────────────────────────────────────────
 
 struct DimensionHistories {
@@ -491,6 +608,8 @@ pub struct SignalPipeline {
     detector_start_times: [Option<std::time::Instant>; 4],
     /// Frozen elapsed seconds after stop (overrides live elapsed from start_times)
     detector_frozen_elapsed: [Option<f32>; 4],
+
+    act_worker: Option<ActWorkerHandle>,
 }
 
 impl SignalPipeline {
@@ -518,6 +637,7 @@ impl SignalPipeline {
             continuous: false,
             detector_start_times: [None; 4],
             detector_frozen_elapsed: [None; 4],
+            act_worker: Some(spawn_act_worker()),
         }
     }
 
@@ -531,6 +651,51 @@ impl SignalPipeline {
         let mut p = Self::new();
         p.trust_input = true;
         p
+    }
+
+    fn drain_act_results(&mut self) {
+        let worker = match &self.act_worker {
+            Some(w) => w,
+            None => return,
+        };
+        while let Ok(result) = worker.result_rx.try_recv() {
+            self.entrainment.apply_transform_result(
+                &result.channel_results,
+                &result.epoch_ok,
+                &result.contact,
+            );
+        }
+    }
+
+    fn send_act_work(
+        &self,
+        windows: [Vec<f64>; 4],
+        epoch_ok: [bool; 4],
+        contact: [ContactQuality; 4],
+    ) {
+        let worker = match &self.act_worker {
+            Some(w) => w,
+            None => return,
+        };
+        let item = ActWorkItem { windows, epoch_ok, contact };
+        if let Err(mpsc::TrySendError::Full(_)) = worker.work_tx.try_send(item) {
+            log::debug!("ACT worker busy, dropping window");
+        }
+    }
+
+    fn start_act_worker(&self, dict_config: &EntrainmentDictConfig) {
+        if let Some(ref w) = self.act_worker {
+            let _ = w.cmd_tx.send(ActWorkerCommand::Start(dict_config.clone()));
+        }
+    }
+
+    /// Stops the ACT engine on the worker, drains remaining results.
+    /// Must be called before entrainment.stop() so final results are applied.
+    fn stop_act_worker(&mut self) {
+        if let Some(ref w) = self.act_worker {
+            let _ = w.cmd_tx.send(ActWorkerCommand::Stop);
+        }
+        self.drain_act_results();
     }
 
     /// Ingest raw EEG samples for one channel.
@@ -595,19 +760,19 @@ impl SignalPipeline {
         let fft = FftSnapshot::from_windows(&window_refs, FS);
         self.last_fft = Some(fft.clone());
 
-        // Feed running detectors
+        // Feed running detectors (cheap FFT-based — inline)
         self.alpha_trend.feed(&fft, &epoch_ok, &self.contact);
         self.approach_unknown.feed(&fft, &epoch_ok, &self.contact);
         self.approach_witnessed.feed(&fft, &epoch_ok, &self.contact);
 
-        // Entrainment needs 1024-sample windows
+        // Entrainment — offloaded to act-worker thread
+        self.drain_act_results();
         if self.entrainment.is_running() {
-            let has_enough = (0..4).all(|ch| self.filtered_bufs[ch].len() >= ENT_WINDOW);
-            if has_enough {
-                let ent_windows: [Vec<f64>; 4] =
-                    std::array::from_fn(|ch| extract_window(&self.filtered_bufs[ch], ENT_WINDOW));
-                let ent_refs: Vec<&[f64]> = ent_windows.iter().map(|w| w.as_slice()).collect();
-                self.entrainment.feed(&ent_refs, &epoch_ok, &self.contact);
+            if let Some(ent_windows) = extract_entrainment_windows(&self.filtered_bufs) {
+                self.entrainment.advance_settling();
+                if self.entrainment.needs_transform() {
+                    self.send_act_work(ent_windows, epoch_ok, self.contact);
+                }
             }
         }
 
@@ -677,15 +842,15 @@ impl SignalPipeline {
                 Ok(())
             }
             PipelineCommand::StartEntrainment => {
-                self.entrainment
-                    .start()
-                    .map_err(|_| "ACT engine creation failed")?;
+                self.entrainment.start_without_engine();
+                self.start_act_worker(&self.entrainment.dict_config.clone());
                 self.detector_start_times[1] = Some(now);
                 self.detector_frozen_elapsed[1] = None;
                 Ok(())
             }
             PipelineCommand::StopEntrainment => {
                 self.freeze_elapsed(1);
+                self.stop_act_worker();
                 self.entrainment.stop();
                 Ok(())
             }
@@ -733,9 +898,8 @@ impl SignalPipeline {
         }
         let now = std::time::Instant::now();
         self.alpha_trend.start();
-        self.entrainment
-            .start()
-            .map_err(|_| "ACT engine creation failed")?;
+        self.entrainment.start_without_engine();
+        self.start_act_worker(&self.entrainment.dict_config.clone());
         self.approach_unknown.start();
         self.approach_witnessed.start();
         self.detector_start_times = [Some(now); 4];
@@ -753,6 +917,7 @@ impl SignalPipeline {
             self.alpha_trend.stop();
         }
         if self.entrainment.is_running() {
+            self.stop_act_worker();
             self.entrainment.stop();
         }
         if self.approach_unknown.is_running() {
@@ -804,6 +969,14 @@ impl SignalPipeline {
             snapshot_unknown(&self.approach_unknown, elapsed[2]),
             snapshot_witnessed(&self.approach_witnessed, elapsed[3]),
         ]
+    }
+}
+
+impl Drop for SignalPipeline {
+    fn drop(&mut self) {
+        if let Some(ref w) = self.act_worker {
+            let _ = w.cmd_tx.send(ActWorkerCommand::Shutdown);
+        }
     }
 }
 

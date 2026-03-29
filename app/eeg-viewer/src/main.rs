@@ -2338,7 +2338,7 @@ fn main() -> eframe::Result<()> {
                 legacy_state,
                 muse_status,
                 device_color_config: DeviceColorConfig::load(),
-                all_devices_mode: false,
+                all_devices_mode: true,
                 show_dimension_settings: false,
                 session_name: None,
                 session_dir: None,

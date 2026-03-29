@@ -122,7 +122,7 @@ All dimension measurements run on reconstructed data from the inference server, 
 3. Frame written to session file (write-ahead log), then sent to inference server over TCP
 4. Server runs ZUNA diffusion on 5-second epochs, preserves `timestamp_us`, sends reconstructed EEGM frame back
 5. TCP recv task routes response by `headband_id` to `DeviceState::push_reconstructed_frame()`
-6. `push_reconstructed_frame` feeds samples into `SignalPipeline`, then drains all available analysis frames in a `while` loop
+6. `push_reconstructed_frame` feeds samples into `SignalPipeline`, which drains ACT worker results via `try_recv` and produces analysis frames in a `while` loop
 7. Each frame stored as `DeviceState.analysis`, read by the UI on the next render tick
 
 ```mermaid
@@ -178,7 +178,7 @@ Pipeline created via `SignalPipeline::new_for_reconstructed()` with `trust_input
 - Settling and measuring phases stall until inference data arrives
 - Progress bars reflect actual data volume; alpha trend shows elapsed time instead of percentage
 - Detectors run until manual stop (no auto-completion). Progress buttons show elapsed seconds.
-- **All-devices mode**: gear icon → "All devices" checkbox. Each Start/Stop button dispatches to every connected Muse simultaneously.
+- **All-devices mode**: gear icon → "All devices" checkbox (on by default). Each Start/Stop button dispatches to every connected Muse simultaneously.
 
 The Neural Aura panel shows a status banner indicating inference connectivity and data flow.
 
@@ -199,13 +199,15 @@ Online linear regression on frontal alpha power (AF7 + AF8 mean). No separate ba
 
 **Attunement (ACT-based)**
 
-1. User clicks "Start Attunement", `EntrainmentDetector::start()` creates an `ActEngine` with a low-frequency dictionary: fc 0.5-4.0 Hz, 1024-sample windows, order 7 chirplets
-2. Each analysis hop, 4-channel filtered EEG windows go through `engine.transform_batch()` via FFI into the C++ ACT library
-3. ACT decomposes each window into chirplets:
+ACT runs on a dedicated `act-worker` OS thread to avoid blocking the data path. The pipeline sends work items via a bounded(2) `mpsc` channel and collects results with non-blocking `try_recv`.
+
+1. User clicks "Start Attunement", `EntrainmentDetector::start_without_engine()` resets detector state, then `start_act_worker()` sends a `Start` command to the worker thread which creates the `ActEngine` with a low-frequency dictionary: fc 0.5-4.0 Hz, 1024-sample windows, order 7 chirplets
+2. Each analysis hop, 4-channel filtered EEG windows are sent to the worker via `try_send`. If the worker is busy (channel full), the window is dropped — measurement extends naturally since `measuring_count` only increments on result arrival
+3. The worker calls `engine.transform_batch()` via FFI into the C++ ACT library (80-200ms, off data path):
    - Coarse search: GPU GEMM of signal against all dictionary atoms (MLX on macOS, CPU on Linux)
    - Greedy matching pursuit: extract top-7 chirplets iteratively, subtract best match each round
    - BFGS refinement (optional): fine-tune each chirplet's `(tc, fc, logDt, c)` parameters via ALGLIB
-4. Detector checks each chirplet's `fc` against `beat_freq +/- tolerance` (default 2.0 +/- 0.5 Hz). Beat-matching chirplets contribute to `beat_energy`, all contribute to `total_energy`
+4. Results return via `mpsc` channel. `drain_act_results()` applies them to the detector's `ChannelAccum` accumulators. Each chirplet's `fc` checked against `beat_freq +/- tolerance` (default 2.0 +/- 0.5 Hz). Beat-matching chirplets contribute to `beat_energy`, all contribute to `total_energy`
 5. Entrainment SNR = `beat_energy / (total_energy - beat_energy)`. Above 1.5 threshold = Porous, below = Boundaried
 
 **Unknown / Witnessed (Approach)**
