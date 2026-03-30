@@ -2,13 +2,21 @@
 
 ## March 28, 2026
 
+## N-device simulation with reconstructed data
+
+`--simulate 4` spawns up to 4 headsets with distinct EEG profiles and feeds both raw and reconstructed frames into the full pipeline. Exercises the complete ACT worker path without a real server or Bluetooth.
+
+## Shared ACT worker fixes Metal crash on 4 devices
+
+Per-pipeline worker threads raced on MLX's process-global Metal command buffer. Single shared thread now serializes all GPU access, with per-item return channels for result routing.
+
 ## ACT processing off the data path
 
-ACT `transform_batch()` (80-200ms C++ FFI) moved from the `DeviceState` mutex to a dedicated `act-worker` OS thread. Communicates via bounded `mpsc` channels — `try_send`/`try_recv` on the data path, both <1us. Graphs no longer stutter during Attunement measurement.
+`transform_batch()` moved from the `DeviceState` mutex to a dedicated OS thread via bounded channels. Graphs no longer stutter during Attunement measurement.
 
 ## All-devices mode defaults to on
 
-"All devices" checkbox starts checked. Start/Stop commands dispatch to all connected Muses by default.
+Start/Stop commands dispatch to all connected Muses by default.
 
 ---
 

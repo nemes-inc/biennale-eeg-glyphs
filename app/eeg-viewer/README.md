@@ -216,14 +216,14 @@ Frontal alpha asymmetry: `(AF8 - AF7) / (AF8 + AF7)`. Positive = Lean, negative 
 
 ### Simulate mode
 
-The `--simulate` flag spawns a fake Muse device generating synthetic 4-channel EEG at 256 Hz. Each channel has a different alpha amplitude and a slow independent envelope so the topography dots visibly pulse. Dimension analysis requires a connected inference server — the simulated device streams raw data to the server, and analysis runs on the reconstructed responses.
+`--simulate N` spawns 1-4 simulated Muse devices, each with a distinct EEG profile: alpha-dominant, theta-dominant, beta-dominant, and mixed alpha+theta. Each device feeds both raw and synthetic reconstructed frames into the full pipeline, so dimension analysis runs without a real inference server or Bluetooth hardware. `--simulate` alone spawns 1 device for backward compatibility.
 
 ```bash
 cd app/eeg-viewer
-cargo run --release -- --simulate
+cargo run --release -- --simulate 4
 ```
 
-This is the fastest way to iterate on visualization code or verify the dimension measurement flow end-to-end.
+This is the fastest way to validate the shared ACT worker, dimension detectors, and visualization across multiple devices.
 
 ### Test server integration
 
@@ -237,7 +237,7 @@ cargo run --release --bin eegm-test-sender -- --target 127.0.0.1:41820 --headban
 
 | Flag | Description |
 | ---- | ----------- |
-| `--simulate` | Launch with a simulated Muse device (synthetic EEG, no BLE) |
+| `--simulate [N]` | Spawn N simulated devices with synthetic EEG and reconstructed data, 1-4, default 1 |
 | `--server ADDR` | Connect to inference server at ADDR |
 | `--stdin` | Read EEGF/EEGD from stdin, disables BLE |
 | `--tcp ADDR` | Listen for one TCP client, disables BLE |

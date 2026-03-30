@@ -10,7 +10,7 @@ use std::sync::Arc;
 use muse_rs::eegm::{EegmFrame, HEADER_SIZE};
 use tokio::sync::mpsc;
 
-use crate::signal_pipeline::{AnalysisFrame, ChannelId, PipelineCommand, SignalPipeline};
+use crate::signal_pipeline::{AnalysisFrame, ChannelId, PipelineCommand, SharedActWorker, SignalPipeline};
 
 /// Channel for sending EEGM frames to the inference server.
 pub type OutboundTx = mpsc::UnboundedSender<EegmFrame>;
@@ -119,7 +119,7 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
-    pub fn new(device_name: String, device_id: String, max_points: usize) -> Self {
+    pub fn new(device_name: String, device_id: String, max_points: usize, shared_worker: SharedActWorker) -> Self {
         Self {
             device_name,
             device_id,
@@ -137,7 +137,7 @@ impl DeviceState {
             stream_start_us: None,
             max_points,
             analysis: AnalysisFrame::default(),
-            inference_pipeline: SignalPipeline::new_for_reconstructed(),
+            inference_pipeline: SignalPipeline::new_for_reconstructed(shared_worker),
             recon_snapshots_fed: 0,
             session_raw_writer: None,
             session_recon_writer: None,
@@ -588,6 +588,11 @@ pub fn extract_channels_from_frame(frame: &EegmFrame) -> Vec<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signal_pipeline::spawn_shared_act_worker;
+
+    fn test_device(name: &str, id: &str, max_points: usize) -> DeviceState {
+        DeviceState::new(name.into(), id.into(), max_points, spawn_shared_act_worker())
+    }
 
     // ── HeadbandId ───────────────────────────────────────────────────────
 
@@ -733,7 +738,7 @@ mod tests {
 
     #[test]
     fn device_state_push_raw_trims() {
-        let mut ds = DeviceState::new("Test".into(), "id".into(), 10);
+        let mut ds = test_device("Test", "id", 10);
         let frame = vec![vec![1.0; 8]; 4];
         ds.push_raw_frame(frame.clone(), 1_000_000);
         ds.push_raw_frame(frame, 2_000_000);
@@ -744,7 +749,7 @@ mod tests {
 
     #[test]
     fn device_state_recording_accumulates() {
-        let mut ds = DeviceState::new("Test".into(), "id".into(), 10);
+        let mut ds = test_device("Test", "id", 10);
         ds.start_recording();
         let frame = vec![vec![1.0; 5]; 4];
         ds.push_raw_frame(frame.clone(), 1_000_000);
@@ -757,7 +762,7 @@ mod tests {
 
     #[test]
     fn device_state_take_recording_clears() {
-        let mut ds = DeviceState::new("Test".into(), "id".into(), 100);
+        let mut ds = test_device("Test", "id", 100);
         ds.start_recording();
         ds.push_raw_frame(vec![vec![1.0; 5]; 4], 1_000_000);
         let (buf, count) = ds.take_recording();
@@ -770,7 +775,7 @@ mod tests {
 
     #[test]
     fn device_state_cancel_recording() {
-        let mut ds = DeviceState::new("Test".into(), "id".into(), 100);
+        let mut ds = test_device("Test", "id", 100);
         ds.start_recording();
         ds.push_raw_frame(vec![vec![1.0; 5]; 4], 1_000_000);
         ds.cancel_recording();
@@ -780,7 +785,7 @@ mod tests {
 
     #[test]
     fn device_state_push_reconstructed() {
-        let mut ds = DeviceState::new("Test".into(), "id".into(), 10);
+        let mut ds = test_device("Test", "id", 10);
         // Need raw data first for stream_start_us
         ds.push_raw_frame(vec![vec![0.0; 5]; 4], 1_000_000);
         let frame = vec![vec![1.0; 5]; 4];
@@ -794,7 +799,7 @@ mod tests {
 
     #[test]
     fn raw_frame_stores_timed_points() {
-        let mut ds = DeviceState::new("T".into(), "id".into(), 1000);
+        let mut ds = test_device("T", "id", 1000);
         // First frame at t=1_000_000 µs (1 second after epoch)
         ds.push_raw_frame(vec![vec![10.0, 20.0]; 4], 1_000_000);
         // stream_start_us should be set to first frame
@@ -810,7 +815,7 @@ mod tests {
 
     #[test]
     fn second_chunk_time_continues() {
-        let mut ds = DeviceState::new("T".into(), "id".into(), 1000);
+        let mut ds = test_device("T", "id", 1000);
         // 256 samples at t=0 → occupies 0.0 to ~1.0 seconds
         ds.push_raw_frame(vec![vec![1.0; 256]; 4], 1_000_000);
         // Next 256 samples 1 second later
@@ -825,7 +830,7 @@ mod tests {
 
     #[test]
     fn recon_aligns_with_raw_by_timestamp() {
-        let mut ds = DeviceState::new("T".into(), "id".into(), 10000);
+        let mut ds = test_device("T", "id", 10000);
         // Raw at t=1_000_000 µs
         ds.push_raw_frame(vec![vec![1.0; 256]; 4], 1_000_000);
         // Recon arrives later but carries the SAME timestamp
@@ -840,7 +845,7 @@ mod tests {
 
     #[test]
     fn recon_ts_zero_falls_back_to_end_of_raw() {
-        let mut ds = DeviceState::new("T".into(), "id".into(), 10000);
+        let mut ds = test_device("T", "id", 10000);
         // Push 256 samples of raw data
         ds.push_raw_frame(vec![vec![1.0; 256]; 4], 1_000_000);
         let raw_last_t = ds.raw_channels[0].last().unwrap()[0];
@@ -861,7 +866,7 @@ mod tests {
             device_id: String::new(),
             headband_id: hid,
             state: std::sync::Arc::new(std::sync::Mutex::new(
-                DeviceState::new(String::new(), String::new(), 100),
+                test_device("", "", 100),
             )),
             stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             join_handle: None,

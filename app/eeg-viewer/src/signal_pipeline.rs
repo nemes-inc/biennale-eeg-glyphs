@@ -457,7 +457,7 @@ fn assemble_analysis_frame(
     }
 }
 
-// ── ACT Worker Types ─────────────────────────────────────────────────────────
+// ── Shared ACT Worker Types ──────────────────────────────────────────────────
 
 const NUM_CH: usize = 4;
 
@@ -465,100 +465,137 @@ struct ActWorkItem {
     windows: [Vec<f64>; NUM_CH],
     epoch_ok: [bool; NUM_CH],
     contact: [ContactQuality; NUM_CH],
+    result_tx: mpsc::Sender<ActResult>,
 }
 
-struct ActWorkResult {
+struct ActResult {
     channel_results: Vec<ChannelResult>,
     epoch_ok: [bool; NUM_CH],
     contact: [ContactQuality; NUM_CH],
 }
 
-enum ActWorkerCommand {
+enum ActCommand {
     Start(EntrainmentDictConfig),
     Stop,
-    Shutdown,
 }
 
-struct ActWorkerHandle {
-    cmd_tx: mpsc::Sender<ActWorkerCommand>,
+#[derive(Clone)]
+pub struct SharedActWorker {
+    cmd_tx: mpsc::Sender<ActCommand>,
     work_tx: mpsc::SyncSender<ActWorkItem>,
-    result_rx: mpsc::Receiver<ActWorkResult>,
 }
 
-// ── ACT Worker Functions ─────────────────────────────────────────────────────
+struct ActHandle {
+    shared: SharedActWorker,
+    result_tx: mpsc::Sender<ActResult>,
+    result_rx: mpsc::Receiver<ActResult>,
+}
 
-fn spawn_act_worker() -> ActWorkerHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<ActWorkerCommand>();
-    let (work_tx, work_rx) = mpsc::sync_channel::<ActWorkItem>(2);
-    let (result_tx, result_rx) = mpsc::channel::<ActWorkResult>();
+impl ActHandle {
+    fn new(shared: SharedActWorker) -> Self {
+        let (result_tx, result_rx) = mpsc::channel();
+        Self { shared, result_tx, result_rx }
+    }
+}
+
+struct ActEngineState {
+    engine: Option<ActEngine>,
+    opts: Option<TransformOpts>,
+    active_count: usize,
+}
+
+impl ActEngineState {
+    fn new() -> Self {
+        Self { engine: None, opts: None, active_count: 0 }
+    }
+
+    fn transform(&self, windows: &[&[f64]]) -> Option<anyhow::Result<Vec<ChannelResult>>> {
+        let (eng, opts) = self.engine.as_ref().zip(self.opts.as_ref())?;
+        Some(eng.transform_batch(windows, opts))
+    }
+
+    /// Creates engine on first activation. Subsequent starts increment the reference count.
+    fn activate(&mut self, dict_config: &EntrainmentDictConfig) {
+        self.active_count += 1;
+        if self.engine.is_some() { return; }
+
+        let act_cfg = dict_config.to_act_config();
+        match ActEngine::new(&act_cfg) {
+            Ok(e) => {
+                log::info!("ACT worker: engine created, dict_size={}", e.dict_size());
+                self.opts = Some(dict_config.to_transform_opts());
+                self.engine = Some(e);
+            }
+            Err(e) => log::error!("ACT worker: engine creation failed: {e}"),
+        }
+    }
+
+    /// Returns true when engine was destroyed — caller should drain the work queue.
+    fn deactivate(&mut self) -> bool {
+        self.active_count = self.active_count.saturating_sub(1);
+        if self.active_count > 0 { return false; }
+
+        self.engine = None;
+        self.opts = None;
+        log::info!("ACT worker: engine stopped, all pipelines idle");
+        true
+    }
+}
+
+// ── Shared ACT Worker Functions ──────────────────────────────────────────────
+
+pub fn spawn_shared_act_worker() -> SharedActWorker {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ActCommand>();
+    let (work_tx, work_rx) = mpsc::sync_channel::<ActWorkItem>(4);
 
     std::thread::Builder::new()
         .name("act-worker".into())
-        .spawn(move || act_worker_loop(cmd_rx, work_rx, result_tx))
+        .spawn(move || shared_act_worker_loop(cmd_rx, work_rx))
         .expect("failed to spawn act-worker thread");
 
-    ActWorkerHandle { cmd_tx, work_tx, result_rx }
+    SharedActWorker { cmd_tx, work_tx }
 }
 
-fn act_worker_loop(
-    cmd_rx: mpsc::Receiver<ActWorkerCommand>,
+fn shared_act_worker_loop(
+    cmd_rx: mpsc::Receiver<ActCommand>,
     work_rx: mpsc::Receiver<ActWorkItem>,
-    result_tx: mpsc::Sender<ActWorkResult>,
 ) {
-    let mut engine: Option<ActEngine> = None;
-    let mut opts: Option<TransformOpts> = None;
+    let mut state = ActEngineState::new();
 
     loop {
+        // Phase 1: drain all pending commands
         loop {
             match cmd_rx.try_recv() {
-                Ok(ActWorkerCommand::Start(dict_config)) => {
-                    let act_cfg = dict_config.to_act_config();
-                    match ActEngine::new(&act_cfg) {
-                        Ok(e) => {
-                            log::info!(
-                                "ACT worker: engine created, dict_size={}",
-                                e.dict_size()
-                            );
-                            opts = Some(dict_config.to_transform_opts());
-                            engine = Some(e);
-                        }
-                        Err(e) => log::error!("ACT worker: engine creation failed: {e}"),
+                Ok(ActCommand::Start(dict_config)) => state.activate(&dict_config),
+                Ok(ActCommand::Stop) => {
+                    if state.deactivate() {
+                        while work_rx.try_recv().is_ok() {}
                     }
-                }
-                Ok(ActWorkerCommand::Stop) => {
-                    engine = None;
-                    opts = None;
-                    while work_rx.try_recv().is_ok() {}
-                    log::info!("ACT worker: engine stopped");
-                }
-                Ok(ActWorkerCommand::Shutdown) => {
-                    log::info!("ACT worker: shutting down");
-                    return;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
         }
 
-        match work_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(item) => {
-                if let (Some(eng), Some(o)) = (&engine, &opts) {
-                    let refs: Vec<&[f64]> =
-                        item.windows.iter().map(|w| w.as_slice()).collect();
-                    match eng.transform_batch(&refs, o) {
-                        Ok(channel_results) => {
-                            let _ = result_tx.send(ActWorkResult {
-                                channel_results,
-                                epoch_ok: item.epoch_ok,
-                                contact: item.contact,
-                            });
-                        }
-                        Err(e) => log::warn!("ACT worker: transform failed: {e}"),
-                    }
-                }
-            }
+        // Phase 2: process one work item
+        let item = match work_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(item) => item,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
+        let refs: Vec<&[f64]> = item.windows.iter().map(|w| w.as_slice()).collect();
+        let Some(transform_result) = state.transform(&refs) else { continue };
+
+        match transform_result {
+            Ok(channel_results) => {
+                let _ = item.result_tx.send(ActResult {
+                    channel_results,
+                    epoch_ok: item.epoch_ok,
+                    contact: item.contact,
+                });
+            }
+            Err(e) => log::warn!("ACT worker: transform failed: {e}"),
         }
     }
 }
@@ -609,11 +646,11 @@ pub struct SignalPipeline {
     /// Frozen elapsed seconds after stop (overrides live elapsed from start_times)
     detector_frozen_elapsed: [Option<f32>; 4],
 
-    act_worker: Option<ActWorkerHandle>,
+    act_handle: Option<ActHandle>,
 }
 
 impl SignalPipeline {
-    pub fn new() -> Self {
+    pub fn new(shared_worker: SharedActWorker) -> Self {
         Self {
             filters: std::array::from_fn(|_| ChannelFilter::new(FS)),
             validators: std::array::from_fn(|_| EpochValidator::default()),
@@ -637,28 +674,24 @@ impl SignalPipeline {
             continuous: false,
             detector_start_times: [None; 4],
             detector_frozen_elapsed: [None; 4],
-            act_worker: Some(spawn_act_worker()),
+            act_handle: Some(ActHandle::new(shared_worker)),
         }
     }
 
-    /// Create a pipeline for server-reconstructed EEG data.
-    ///
-    /// The inference server already denoises and validates the signal,
-    /// so raw-BLE artifact checks (contact quality, 150 µV amplitude
-    /// limit) are inappropriate and would reject valid reconstructed
-    /// epochs.  This constructor disables those checks.
-    pub fn new_for_reconstructed() -> Self {
-        let mut p = Self::new();
+    /// Reconstructed data is already denoised by the inference server,
+    /// so contact quality and epoch validation are skipped.
+    pub fn new_for_reconstructed(shared_worker: SharedActWorker) -> Self {
+        let mut p = Self::new(shared_worker);
         p.trust_input = true;
         p
     }
 
     fn drain_act_results(&mut self) {
-        let worker = match &self.act_worker {
-            Some(w) => w,
+        let handle = match &self.act_handle {
+            Some(h) => h,
             None => return,
         };
-        while let Ok(result) = worker.result_rx.try_recv() {
+        while let Ok(result) = handle.result_rx.try_recv() {
             self.entrainment.apply_transform_result(
                 &result.channel_results,
                 &result.epoch_ok,
@@ -673,27 +706,31 @@ impl SignalPipeline {
         epoch_ok: [bool; 4],
         contact: [ContactQuality; 4],
     ) {
-        let worker = match &self.act_worker {
-            Some(w) => w,
+        let handle = match &self.act_handle {
+            Some(h) => h,
             None => return,
         };
-        let item = ActWorkItem { windows, epoch_ok, contact };
-        if let Err(mpsc::TrySendError::Full(_)) = worker.work_tx.try_send(item) {
+        let item = ActWorkItem {
+            windows,
+            epoch_ok,
+            contact,
+            result_tx: handle.result_tx.clone(),
+        };
+        if let Err(mpsc::TrySendError::Full(_)) = handle.shared.work_tx.try_send(item) {
             log::debug!("ACT worker busy, dropping window");
         }
     }
 
     fn start_act_worker(&self, dict_config: &EntrainmentDictConfig) {
-        if let Some(ref w) = self.act_worker {
-            let _ = w.cmd_tx.send(ActWorkerCommand::Start(dict_config.clone()));
+        if let Some(ref h) = self.act_handle {
+            let _ = h.shared.cmd_tx.send(ActCommand::Start(dict_config.clone()));
         }
     }
 
-    /// Stops the ACT engine on the worker, drains remaining results.
-    /// Must be called before entrainment.stop() so final results are applied.
+    /// Call before entrainment.stop() so final results are applied.
     fn stop_act_worker(&mut self) {
-        if let Some(ref w) = self.act_worker {
-            let _ = w.cmd_tx.send(ActWorkerCommand::Stop);
+        if let Some(ref h) = self.act_handle {
+            let _ = h.shared.cmd_tx.send(ActCommand::Stop);
         }
         self.drain_act_results();
     }
@@ -972,19 +1009,15 @@ impl SignalPipeline {
     }
 }
 
-impl Drop for SignalPipeline {
-    fn drop(&mut self) {
-        if let Some(ref w) = self.act_worker {
-            let _ = w.cmd_tx.send(ActWorkerCommand::Shutdown);
-        }
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pipeline() -> SignalPipeline {
+        SignalPipeline::new(spawn_shared_act_worker())
+    }
 
     // ── ChannelId ────────────────────────────────────────────────────────
 
@@ -1220,7 +1253,7 @@ mod tests {
 
     #[test]
     fn sp_pipeline_no_analysis_without_enough_data() {
-        let mut pipeline = SignalPipeline::new();
+        let mut pipeline = test_pipeline();
         // Feed fewer than HOP_SAMPLES on TP9
         pipeline.ingest_samples(ChannelId::TP9, &[0.0; 32]);
         assert!(pipeline.try_analyze().is_none());
@@ -1228,7 +1261,7 @@ mod tests {
 
     #[test]
     fn sp_pipeline_no_analysis_without_all_channels() {
-        let mut pipeline = SignalPipeline::new();
+        let mut pipeline = test_pipeline();
         // Feed enough on TP9 but nothing on other channels
         pipeline.ingest_samples(ChannelId::TP9, &[0.0; 128]);
         assert!(pipeline.try_analyze().is_none());
@@ -1236,7 +1269,7 @@ mod tests {
 
     #[test]
     fn sp_pipeline_produces_frame_when_ready() {
-        let mut pipeline = SignalPipeline::new();
+        let mut pipeline = test_pipeline();
         // Feed enough data on all 4 channels
         let signal: Vec<f64> = (0..FFT_WINDOW + HOP_SAMPLES)
             .map(|i| (i as f64 * 10.0 * std::f64::consts::TAU / FS).sin() * 50.0)
@@ -1255,7 +1288,7 @@ mod tests {
 
     #[test]
     fn sp_pipeline_hop_drains_excess_samples() {
-        let mut pipeline = SignalPipeline::new();
+        let mut pipeline = test_pipeline();
         // Feed exactly FFT_WINDOW + HOP_SAMPLES (576 = 512 + 64)
         let signal: Vec<f64> = vec![0.0; FFT_WINDOW + HOP_SAMPLES];
         for ch in ChannelId::ALL {
@@ -1274,14 +1307,14 @@ mod tests {
 
     #[test]
     fn sp_pipeline_command_alpha_trend() {
-        let mut pipeline = SignalPipeline::new();
+        let mut pipeline = test_pipeline();
         assert!(pipeline.execute_command(PipelineCommand::StartAlphaTrend).is_ok());
         assert!(pipeline.execute_command(PipelineCommand::StopAlphaTrend).is_ok());
     }
 
     #[test]
     fn sp_pipeline_command_approach() {
-        let mut pipeline = SignalPipeline::new();
+        let mut pipeline = test_pipeline();
         assert!(pipeline.execute_command(PipelineCommand::StartUnknown).is_ok());
         assert!(pipeline.execute_command(PipelineCommand::StartWitnessed).is_ok());
     }

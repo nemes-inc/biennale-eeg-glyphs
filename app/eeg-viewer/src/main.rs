@@ -36,7 +36,8 @@ use device_state::{
 };
 use muse_ble::ScanResult;
 use signal_pipeline::{
-    AnalysisFrame, DimensionReading, PipelineCommand, VizMode,
+    spawn_shared_act_worker, AnalysisFrame, DimensionReading, PipelineCommand, SharedActWorker,
+    VizMode,
 };
 use tcp_client::DeviceMap;
 
@@ -120,9 +121,9 @@ struct Args {
     )]
     muse_record_bin: PathBuf,
 
-    /// Launch with a simulated Muse device (synthetic EEG, no BLE needed).
-    #[arg(long)]
-    simulate: bool,
+    /// Simulated Muse devices, 1-4. Synthetic EEG with reconstructed data, no BLE needed.
+    #[arg(long, default_value_t = 0, default_missing_value = "1", num_args = 0..=1)]
+    simulate: u32,
 
     /// Path to `services/print-glyph` directory.
     #[arg(
@@ -204,7 +205,10 @@ struct EegViewerApp {
     #[allow(dead_code)]
     print_glyph_dir: PathBuf,
     #[allow(dead_code)]
-    simulate: bool,
+    simulate: u32,
+
+    // ── Shared ACT worker, single GPU thread for all pipelines ──
+    shared_act_worker: SharedActWorker,
 
     // ── Device color config ──
     device_color_config: DeviceColorConfig,
@@ -318,6 +322,82 @@ fn resolve_input_kind(args: &Args) -> InputKind {
     }
 }
 
+// ── Simulation signal profiles and pure generators ──────────────────────────
+
+/// EEG signal character for one simulated headband, matching eegm_test_sender profiles.
+struct SimProfile {
+    label: &'static str,
+    device_id: &'static str,
+    oscillations: &'static [(f64, f64, f64)], // freq_hz, amp_uv, phase_offset
+    noise_amp: f64,
+}
+
+const SIM_PROFILES: [SimProfile; 4] = [
+    SimProfile {
+        label: "Sim-Alpha",
+        device_id: "sim-alpha",
+        oscillations: &[(10.0, 18.0, 0.0), (20.0, 3.0, 0.5)],
+        noise_amp: 4.0,
+    },
+    SimProfile {
+        label: "Sim-Theta",
+        device_id: "sim-theta",
+        oscillations: &[(6.0, 14.0, 0.0), (10.0, 5.0, 0.3)],
+        noise_amp: 5.0,
+    },
+    SimProfile {
+        label: "Sim-Beta",
+        device_id: "sim-beta",
+        oscillations: &[(20.0, 10.0, 0.0), (10.0, 4.0, 0.7), (40.0, 2.0, 0.2)],
+        noise_amp: 6.0,
+    },
+    SimProfile {
+        label: "Sim-Mixed",
+        device_id: "sim-mixed",
+        oscillations: &[(10.0, 12.0, 0.0), (6.0, 10.0, 0.4), (13.0, 3.0, 0.9)],
+        noise_amp: 5.0,
+    },
+];
+
+/// Temporal channels attenuated relative to frontal, matching real Muse electrode placement.
+const CH_SCALE: [f64; 4] = [0.6, 1.0, 1.0, 0.6];
+
+/// Generate one channel's worth of EEG samples from a signal profile.
+fn generate_sim_samples(
+    profile: &SimProfile,
+    ch_idx: usize,
+    t: f64,
+    dt: f64,
+    samples_per_packet: usize,
+) -> Vec<f32> {
+    use std::f64::consts::TAU;
+    let scale = CH_SCALE[ch_idx];
+    (0..samples_per_packet)
+        .map(|i| {
+            let ti = t + i as f64 * dt;
+            let signal: f64 = profile
+                .oscillations
+                .iter()
+                .map(|&(freq, amp, phase)| amp * (TAU * freq * ti + phase).sin())
+                .sum();
+            let noise = profile.noise_amp * (TAU * 47.3 * ti + ch_idx as f64).sin();
+            ((signal * scale) + noise) as f32
+        })
+        .collect()
+}
+
+/// Generate a complete 4-channel EEG frame from a signal profile.
+fn generate_sim_frame(
+    profile: &SimProfile,
+    t: f64,
+    dt: f64,
+    samples_per_packet: usize,
+) -> Vec<Vec<f32>> {
+    (0..4)
+        .map(|ch| generate_sim_samples(profile, ch, t, dt, samples_per_packet))
+        .collect()
+}
+
 // ── EegViewerApp: Multi-device methods ──────────────────────────────────────
 
 impl EegViewerApp {
@@ -397,6 +477,7 @@ impl EegViewerApp {
             device_name,
             device_id.clone(),
             self.max_points,
+            self.shared_act_worker.clone(),
         )));
 
         let sr = self.scan_results.remove(scan_idx);
@@ -513,94 +594,95 @@ impl EegViewerApp {
         device.was_streaming = false;
     }
 
-    /// Spawn a simulated device that generates synthetic EEG data.
-    fn spawn_simulated_device(&mut self) {
+    /// Spawn N simulated devices with distinct EEG profiles and synthetic reconstructed data.
+    fn spawn_simulated_devices(&mut self, count: u32) {
         use std::sync::atomic::AtomicBool;
         use device_state::HeadbandId;
 
-        let headband_id = HeadbandId::new(0).unwrap();
-        let state = Arc::new(Mutex::new(DeviceState::new(
-            "Simulated".to_string(),
-            "sim-0000".to_string(),
-            self.max_points,
-        )));
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
-        let state_clone = Arc::clone(&state);
+        // Cap at max headband slots
+        let count = count.min(HeadbandId::MAX);
 
-        let join = self.tokio_rt.spawn(async move {
-            let mut t: f64 = 0.0;
-            let dt = 1.0 / 256.0;
-            let samples_per_packet = 12; // Muse sends 12 samples per BLE packet
+        for i in 0..count {
+            let headband_id = match next_available_headband_id(&self.connected_devices) {
+                Some(id) => id,
+                None => break,
+            };
 
-            loop {
-                if stop_clone.load(Ordering::SeqCst) {
-                    break;
+            let profile = &SIM_PROFILES[i as usize % SIM_PROFILES.len()];
+
+            let state = Arc::new(Mutex::new(DeviceState::new(
+                profile.label.to_string(),
+                profile.device_id.to_string(),
+                self.max_points,
+                self.shared_act_worker.clone(),
+            )));
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = Arc::clone(&stop);
+            let state_clone = Arc::clone(&state);
+            let profile_idx = i as usize % SIM_PROFILES.len();
+
+            let join = self.tokio_rt.spawn(async move {
+                let profile = &SIM_PROFILES[profile_idx];
+                let dt = 1.0 / 256.0;
+                let samples_per_packet = 12;
+                let mut t: f64 = 0.0;
+
+                loop {
+                    if stop_clone.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let frame = generate_sim_frame(profile, t, dt, samples_per_packet);
+                    let timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+
+                    // Raw and reconstructed fed separately, matching the real BLE+TCP path
+                    {
+                        let mut st = state_clone.lock().unwrap();
+                        st.push_raw_frame(frame.clone(), timestamp_us);
+                    }
+                    {
+                        let mut st = state_clone.lock().unwrap();
+                        st.push_reconstructed_frame(frame, timestamp_us);
+                    }
+
+                    t += samples_per_packet as f64 * dt;
+                    tokio::time::sleep(Duration::from_millis(47)).await;
                 }
+            });
 
-                // Generate synthetic EEG: 10 Hz alpha with per-channel
-                // amplitude modulation so electrode dots visibly differ.
-                let mut frame: Vec<Vec<f32>> = Vec::with_capacity(4);
-                let ch_envelope_freq = [0.07, 0.11, 0.13, 0.05]; // Hz
-                let ch_base_amp = [15.0, 25.0, 20.0, 30.0]; // µV
-                for ch_idx in 0..4usize {
-                    let samples: Vec<f32> = (0..samples_per_packet)
-                        .map(|i| {
-                            let ti = t + i as f64 * dt;
-                            let envelope = 0.3 + 0.7
-                                * (2.0 * std::f64::consts::PI * ch_envelope_freq[ch_idx] * ti)
-                                    .sin()
-                                    .abs();
-                            let alpha = ch_base_amp[ch_idx] * envelope
-                                * (2.0 * std::f64::consts::PI * 10.0 * ti).sin();
-                            let noise = 3.0
-                                * (2.0 * std::f64::consts::PI * 47.3 * ti + ch_idx as f64).sin();
-                            (alpha + noise) as f32
-                        })
-                        .collect();
-                    frame.push(samples);
-                }
-
-                // Feed the waveform display via push_raw_frame
-                let timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as u64)
-                    .unwrap_or(0);
-                state_clone.lock().unwrap().push_raw_frame(frame, timestamp_us);
-
-                t += samples_per_packet as f64 * dt;
-
-                // ~256 Hz: 12 samples every ~47ms
-                tokio::time::sleep(Duration::from_millis(47)).await;
+            {
+                let mut st = state.lock().unwrap();
+                st.status_line = "Simulated".to_string();
+                st.streaming = true;
             }
-        });
 
-        {
-            let mut st = state.lock().unwrap();
-            st.status_line = "Simulated".to_string();
-            st.streaming = true;
+            self.connected_devices.push(ConnectedDevice {
+                device_name: profile.label.to_string(),
+                device_id: profile.device_id.to_string(),
+                headband_id,
+                state,
+                stop_flag: stop,
+                join_handle: Some(join),
+                last_saved_fif: None,
+                record_started_at: None,
+                last_record_toggle: None,
+                epoch_seq: 0,
+                session_path: None,
+                pipeline_cmd_tx: None,
+                tab_color_idx: (i as usize % TAB_COLORS.len()) as u8,
+                disconnect_blink_until: None,
+                was_streaming: false,
+                glyph_selections: [(true, 0); 4],
+            });
         }
 
-        self.connected_devices.push(ConnectedDevice {
-            device_name: "Simulated Muse".to_string(),
-            device_id: "sim-0000".to_string(),
-            headband_id,
-            state,
-            stop_flag: stop,
-            join_handle: Some(join),
-            last_saved_fif: None,
-            record_started_at: None,
-            last_record_toggle: None,
-            epoch_seq: 0,
-            session_path: None,
-            pipeline_cmd_tx: None,
-            tab_color_idx: 0,
-            disconnect_blink_until: None,
-            was_streaming: false,
-            glyph_selections: [(true, 0); 4],
-        });
-
-        self.active_tab = 0;
+        if !self.connected_devices.is_empty() {
+            self.active_tab = 0;
+        }
     }
 
     fn start_session(&mut self) {
@@ -2337,6 +2419,7 @@ fn main() -> eframe::Result<()> {
                 simulate,
                 legacy_state,
                 muse_status,
+                shared_act_worker: spawn_shared_act_worker(),
                 device_color_config: DeviceColorConfig::load(),
                 all_devices_mode: true,
                 show_dimension_settings: false,
@@ -2346,10 +2429,80 @@ fn main() -> eframe::Result<()> {
                 resume_muse_pending: false,
                 reset_confirm_pending: false,
             };
-            if simulate {
-                app.spawn_simulated_device();
+            if simulate > 0 {
+                app.spawn_simulated_devices(simulate);
             }
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sim_samples_length_matches_request() {
+        let profile = &SIM_PROFILES[0];
+        let samples = generate_sim_samples(profile, 0, 0.0, 1.0 / 256.0, 12);
+        assert_eq!(samples.len(), 12);
+    }
+
+    #[test]
+    fn sim_samples_vary_across_channels() {
+        let profile = &SIM_PROFILES[0];
+        let dt = 1.0 / 256.0;
+        let ch0 = generate_sim_samples(profile, 0, 0.5, dt, 12);
+        let ch1 = generate_sim_samples(profile, 1, 0.5, dt, 12);
+        // Temporal vs frontal scaling makes them differ
+        assert_ne!(ch0, ch1);
+    }
+
+    #[test]
+    fn sim_samples_deterministic() {
+        let profile = &SIM_PROFILES[2];
+        let a = generate_sim_samples(profile, 1, 1.0, 1.0 / 256.0, 12);
+        let b = generate_sim_samples(profile, 1, 1.0, 1.0 / 256.0, 12);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sim_frame_has_four_channels() {
+        let profile = &SIM_PROFILES[1];
+        let frame = generate_sim_frame(profile, 0.0, 1.0 / 256.0, 12);
+        assert_eq!(frame.len(), 4);
+        for ch in &frame {
+            assert_eq!(ch.len(), 12);
+        }
+    }
+
+    #[test]
+    fn sim_profiles_have_distinct_signals() {
+        let dt = 1.0 / 256.0;
+        let frames: Vec<_> = SIM_PROFILES
+            .iter()
+            .map(|p| generate_sim_frame(p, 0.0, dt, 12))
+            .collect();
+        // Each profile should produce different waveforms
+        for i in 0..frames.len() {
+            for j in (i + 1)..frames.len() {
+                assert_ne!(frames[i], frames[j], "profiles {} and {} produced identical frames", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn sim_temporal_channels_attenuated() {
+        let profile = &SIM_PROFILES[0];
+        let dt = 1.0 / 256.0;
+        let frame = generate_sim_frame(profile, 0.0, dt, 64);
+        // RMS of temporal channels (0, 3) should be lower than frontal (1, 2)
+        let rms = |ch: &[f32]| -> f64 {
+            let sum: f64 = ch.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+            (sum / ch.len() as f64).sqrt()
+        };
+        let rms_temporal = (rms(&frame[0]) + rms(&frame[3])) / 2.0;
+        let rms_frontal = (rms(&frame[1]) + rms(&frame[2])) / 2.0;
+        assert!(rms_temporal < rms_frontal, "temporal RMS {rms_temporal} should be less than frontal RMS {rms_frontal}");
+    }
 }
